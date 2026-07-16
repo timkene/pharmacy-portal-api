@@ -80,11 +80,13 @@ def _bid_to_out(bid: dict) -> BidOut:
 
 
 def _order_summary(order: dict, bid_count: int) -> OrderSummary:
+    meds = order.get("medications", [])
+    diagnosis = meds[0].get("diagnosis", "—") if meds else "—"
     return OrderSummary(
         id=str(order["_id"]),
         intakeId=order["intakeId"],
         enrolleeFullName=order["enrollee"]["fullName"],
-        diagnosis=order["diagnosis"],
+        diagnosis=diagnosis,
         status=order["status"],
         biddingEndsAt=order["biddingEndsAt"],
         createdAt=order["createdAt"],
@@ -97,7 +99,6 @@ def _order_detail(order: dict, bids: list[BidOut], is_staff: bool) -> OrderDetai
         id=str(order["_id"]),
         intakeId=order["intakeId"],
         enrollee=Enrollee(**order["enrollee"]),
-        diagnosis=order["diagnosis"],
         medications=[Medication(**m) for m in order["medications"]],
         biddingEndsAt=order["biddingEndsAt"],
         status=order["status"],
@@ -231,7 +232,6 @@ async def create_order(
     doc = {
         "intakeId": generate_intake_id(),
         "enrollee": body.enrollee.model_dump(),
-        "diagnosis": body.diagnosis,
         "medications": [m.model_dump() for m in body.medications],
         "biddingEndsAt": now + timedelta(minutes=10),
         "status": "bidding",

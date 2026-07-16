@@ -53,11 +53,11 @@ class Medication(BaseModel):
     name: str
     quantity: int
     dosage: str
+    diagnosis: str
 
 
 class CreateOrderRequest(BaseModel):
     enrollee: Enrollee
-    diagnosis: str
     medications: List[Medication]
 
 
@@ -86,7 +86,6 @@ class OrderDetail(BaseModel):
     id: str
     intakeId: str
     enrollee: Enrollee
-    diagnosis: str
     medications: List[Medication]
     biddingEndsAt: datetime
     status: str
