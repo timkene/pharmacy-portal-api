@@ -20,6 +20,7 @@ from models.schemas import (
     OrderListResponse,
     OrderSummary,
     PlaceBidRequest,
+    Provider,
     VerifyCollectionRequest,
 )
 
@@ -82,10 +83,14 @@ def _bid_to_out(bid: dict) -> BidOut:
 def _order_summary(order: dict, bid_count: int) -> OrderSummary:
     meds = order.get("medications", [])
     diagnosis = meds[0].get("diagnosis", "—") if meds else "—"
+    enrollee = order.get("enrollee", {})
+    full_name = enrollee.get("fullName") or (
+        f"{enrollee.get('firstname', '')} {enrollee.get('lastname', '')}".strip()
+    ) or "—"
     return OrderSummary(
         id=str(order["_id"]),
         intakeId=order["intakeId"],
-        enrolleeFullName=order["enrollee"]["fullName"],
+        enrolleeFullName=full_name,
         diagnosis=diagnosis,
         status=order["status"],
         biddingEndsAt=order["biddingEndsAt"],
@@ -95,10 +100,18 @@ def _order_summary(order: dict, bid_count: int) -> OrderSummary:
 
 
 def _order_detail(order: dict, bids: list[BidOut], is_staff: bool) -> OrderDetail:
+    enrollee_raw = order.get("enrollee", {})
+    enrollee = Enrollee(
+        enrolleeId=enrollee_raw.get("enrolleeId", ""),
+        fullName=enrollee_raw.get("fullName", ""),
+    )
+    provider_raw = order.get("provider")
+    provider = Provider(**provider_raw) if provider_raw else None
     return OrderDetail(
         id=str(order["_id"]),
         intakeId=order["intakeId"],
-        enrollee=Enrollee(**order["enrollee"]),
+        enrollee=enrollee,
+        provider=provider,
         medications=[Medication(**m) for m in order["medications"]],
         biddingEndsAt=order["biddingEndsAt"],
         status=order["status"],
@@ -232,6 +245,7 @@ async def create_order(
     doc = {
         "intakeId": generate_intake_id(),
         "enrollee": body.enrollee.model_dump(),
+        "provider": body.provider.model_dump(),
         "medications": [m.model_dump() for m in body.medications],
         "biddingEndsAt": now + timedelta(minutes=10),
         "status": "bidding",

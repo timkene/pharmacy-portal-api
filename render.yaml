@@ -11,3 +11,5 @@ services:
         value: pharmacy_dispatch
       - key: ENVIRONMENT
         value: production
+      - key: MOTHERDUCK_TOKEN
+        sync: false

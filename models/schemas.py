@@ -44,20 +44,27 @@ class AuthResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class Enrollee(BaseModel):
-    fullName: str
     enrolleeId: str
-    plan: str
+    fullName: str
+
+
+class Provider(BaseModel):
+    providerId: str
+    providerName: str
 
 
 class Medication(BaseModel):
+    procedureCode: Optional[str] = None
     name: str
-    quantity: int
     dosage: str
+    quantity: int
+    diagnosisCode: Optional[str] = None
     diagnosis: str
 
 
 class CreateOrderRequest(BaseModel):
     enrollee: Enrollee
+    provider: Provider
     medications: List[Medication]
 
 
@@ -86,6 +93,7 @@ class OrderDetail(BaseModel):
     id: str
     intakeId: str
     enrollee: Enrollee
+    provider: Optional[Provider] = None
     medications: List[Medication]
     biddingEndsAt: datetime
     status: str
