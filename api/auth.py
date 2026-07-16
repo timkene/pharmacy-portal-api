@@ -35,14 +35,12 @@ async def staff_login(body: StaffLoginRequest, response: Response):
         "name": user["name"],
         "email": user["email"],
     }
-    response.set_cookie(
-        key="staff_session",
-        value=encode_session(payload),
-        **cookie_kwargs(),
-    )
+    session_value = encode_session(payload)
+    response.set_cookie(key="staff_session", value=session_value, **cookie_kwargs())
     return AuthResponse(
         success=True,
         user=UserResponse(name=user["name"], email=user["email"]),
+        session=session_value,
     )
 
 
@@ -75,12 +73,9 @@ async def aggregator_signup(body: AggregatorSignupRequest, response: Response):
         "name": body.companyName,
         "email": body.email,
     }
-    response.set_cookie(
-        key="aggregator_session",
-        value=encode_session(payload),
-        **cookie_kwargs(),
-    )
-    return AuthResponse(success=True)
+    session_value = encode_session(payload)
+    response.set_cookie(key="aggregator_session", value=session_value, **cookie_kwargs())
+    return AuthResponse(success=True, session=session_value)
 
 
 # ---------------------------------------------------------------------------
@@ -99,14 +94,12 @@ async def aggregator_login(body: AggregatorLoginRequest, response: Response):
         "name": user["companyName"],
         "email": user["email"],
     }
-    response.set_cookie(
-        key="aggregator_session",
-        value=encode_session(payload),
-        **cookie_kwargs(),
-    )
+    session_value = encode_session(payload)
+    response.set_cookie(key="aggregator_session", value=session_value, **cookie_kwargs())
     return AuthResponse(
         success=True,
         user=UserResponse(name=user["companyName"], email=user["email"]),
+        session=session_value,
     )
 
 

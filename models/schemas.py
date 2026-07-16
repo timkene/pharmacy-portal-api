@@ -36,6 +36,7 @@ class UserResponse(BaseModel):
 class AuthResponse(BaseModel):
     success: bool
     user: Optional[UserResponse] = None
+    session: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
