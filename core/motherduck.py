@@ -13,8 +13,9 @@ def _query_sync(sql: str, params: list | None = None) -> list[dict]:
     import duckdb  # noqa: PLC0415
     conn = duckdb.connect(f"md:ai_driven_data?motherduck_token={MOTHERDUCK_TOKEN}")
     try:
-        result = conn.execute(sql, params or []).fetchdf()
-        return result.to_dict("records")
+        cursor = conn.execute(sql, params or [])
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
     finally:
         conn.close()
 
