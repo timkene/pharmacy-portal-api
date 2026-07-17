@@ -58,6 +58,9 @@ class Medication(BaseModel):
     name: str
     dosage: str
     quantity: int
+    tablets: int = 1
+    frequency: Optional[str] = None
+    durationDays: Optional[int] = None
     diagnosisCode: Optional[str] = None
     diagnosis: str
 
