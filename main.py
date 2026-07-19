@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api import aggregator, auth, orders
+from api import aggregator, auth, orders, search
 from core.database import close_db, connect_db
 
 
@@ -30,6 +30,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/auth")
 app.include_router(orders.router, prefix="/api")
 app.include_router(aggregator.router, prefix="/api")
+app.include_router(search.router, prefix="/api")
 
 @app.get("/health")
 async def health():

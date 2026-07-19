@@ -46,6 +46,8 @@ class AuthResponse(BaseModel):
 class Enrollee(BaseModel):
     enrolleeId: str
     fullName: str
+    phone: Optional[str] = None
+    address: Optional[str] = None
 
 
 class Provider(BaseModel):
@@ -103,8 +105,6 @@ class OrderDetail(BaseModel):
     winnerId: Optional[str] = None
     winnerName: Optional[str] = None
     winnerTotalPrice: Optional[float] = None
-    collectionCode: Optional[str] = None
-    approvalCode: Optional[str] = None
     createdAt: datetime
     createdBy: str
     bids: List[BidOut] = []
@@ -141,17 +141,8 @@ class AggregatorDashboardResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Collection verification
+# Klaire callback
 # ---------------------------------------------------------------------------
 
-class VerifyCollectionRequest(BaseModel):
-    code: str
-
-
-# ---------------------------------------------------------------------------
-# Approval
-# ---------------------------------------------------------------------------
-
-class ApprovalResponse(BaseModel):
-    success: bool
-    approvalCode: str
+class KlaireCallbackRequest(BaseModel):
+    received: bool

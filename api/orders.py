@@ -7,26 +7,31 @@ from fastapi import APIRouter, Cookie, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from core.database import get_db
-from core.security import decode_session, generate_code, generate_intake_id
+from core.klaire_client import (
+    notify_order_accepted,
+    notify_order_created,
+    notify_order_fulfilled,
+)
+from core.security import decode_session, generate_intake_id
 from core.sse import sse_manager
 from models.schemas import (
-    ApprovalResponse,
     BidOut,
     CreateOrderRequest,
     CreateOrderResponse,
     Enrollee,
+    KlaireCallbackRequest,
     Medication,
     OrderDetail,
     OrderListResponse,
     OrderSummary,
     PlaceBidRequest,
     Provider,
-    VerifyCollectionRequest,
 )
 
 router = APIRouter(tags=["orders"])
 
 KEEPALIVE_INTERVAL = 15  # seconds
+BIDDING_WINDOW_MINUTES = 15
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +104,33 @@ def _order_summary(order: dict, bid_count: int) -> OrderSummary:
     )
 
 
-def _order_detail(order: dict, bids: list[BidOut], is_staff: bool) -> OrderDetail:
+def _order_detail(
+    order: dict,
+    bids: list[BidOut],
+    *,
+    is_staff: bool = False,
+    viewer_aggregator_id: str | None = None,
+) -> OrderDetail:
     enrollee_raw = order.get("enrollee", {})
-    enrollee = Enrollee(
-        enrolleeId=enrollee_raw.get("enrolleeId", ""),
-        fullName=enrollee_raw.get("fullName", ""),
-    )
+    winner_id = order.get("winnerId")
+    is_winner = viewer_aggregator_id and viewer_aggregator_id == winner_id
+
+    # Hide enrolleeId and phone from aggregators who are not the winner
+    if is_staff or is_winner:
+        enrollee = Enrollee(
+            enrolleeId=enrollee_raw.get("enrolleeId", ""),
+            fullName=enrollee_raw.get("fullName", ""),
+            phone=enrollee_raw.get("phone"),
+            address=enrollee_raw.get("address"),
+        )
+    else:
+        # Non-winner aggregators see name and address only — no ID or phone
+        enrollee = Enrollee(
+            enrolleeId="",
+            fullName=enrollee_raw.get("fullName", ""),
+            address=enrollee_raw.get("address"),
+        )
+
     provider_raw = order.get("provider")
     provider = Provider(**provider_raw) if provider_raw else None
     return OrderDetail(
@@ -115,15 +141,17 @@ def _order_detail(order: dict, bids: list[BidOut], is_staff: bool) -> OrderDetai
         medications=[Medication(**m) for m in order["medications"]],
         biddingEndsAt=order["biddingEndsAt"],
         status=order["status"],
-        winnerId=order.get("winnerId"),
+        winnerId=winner_id,
         winnerName=order.get("winnerName"),
         winnerTotalPrice=order.get("winnerTotalPrice"),
-        collectionCode=order.get("collectionCode") if is_staff else None,
-        approvalCode=order.get("approvalCode") if is_staff else None,
         createdAt=order["createdAt"],
         createdBy=order["createdBy"],
         bids=bids,
     )
+
+
+def _med_names(order: dict) -> list[str]:
+    return [m.get("name", "") for m in order.get("medications", []) if m.get("name")]
 
 
 # ---------------------------------------------------------------------------
@@ -145,25 +173,18 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
 
     now = datetime.now(timezone.utc)
     bidding_ends = order["biddingEndsAt"]
-    # Ensure timezone-aware comparison
     if bidding_ends.tzinfo is None:
         bidding_ends = bidding_ends.replace(tzinfo=timezone.utc)
 
     if now < bidding_ends:
         return order
 
-    # Bidding has expired — find the lowest bid
+    # Bidding has expired — find the lowest total price bid
     bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1).limit(1)
     winning_bids = await bids_cursor.to_list(1)
 
     if not winning_bids:
-        # No bids placed — mark as awaiting_fulfillment with no winner
-        update = {
-            "$set": {
-                "status": "awaiting_fulfillment",
-                "collectionCode": generate_code(6),
-            }
-        }
+        update = {"$set": {"status": "awaiting_fulfillment"}}
         await db.orders.update_one({"_id": ObjectId(order_id)}, update)
         order = await db.orders.find_one({"_id": ObjectId(order_id)})
         await sse_manager.broadcast(
@@ -174,15 +195,12 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
         return order
 
     winner = winning_bids[0]
-    collection_code = generate_code(6)
-
     update = {
         "$set": {
             "status": "awaiting_fulfillment",
             "winnerId": winner["aggregatorId"],
             "winnerName": winner["aggregatorName"],
             "winnerTotalPrice": winner["totalPrice"],
-            "collectionCode": collection_code,
         }
     }
     await db.orders.update_one({"_id": ObjectId(order_id)}, update)
@@ -247,19 +265,31 @@ async def create_order(
         "enrollee": body.enrollee.model_dump(),
         "provider": body.provider.model_dump(),
         "medications": [m.model_dump() for m in body.medications],
-        "biddingEndsAt": now + timedelta(minutes=10),
+        "biddingEndsAt": now + timedelta(minutes=BIDDING_WINDOW_MINUTES),
         "status": "bidding",
         "winnerId": None,
         "winnerName": None,
         "winnerTotalPrice": None,
-        "collectionCode": None,
-        "approvalCode": None,
         "createdAt": now,
         "createdBy": staff_user["userId"],
     }
 
     result = await db.orders.insert_one(doc)
-    return CreateOrderResponse(success=True, orderId=str(result.inserted_id))
+    order_id = str(result.inserted_id)
+
+    # Notify enrollee via Klaire if they have a phone number
+    phone = body.enrollee.phone
+    if phone:
+        med_names = [m.name for m in body.medications if m.name]
+        asyncio.create_task(notify_order_created(
+            phone=phone,
+            enrollee_id=body.enrollee.enrolleeId,
+            enrollee_name=body.enrollee.fullName,
+            medications=med_names,
+            order_id=order_id,
+        ))
+
+    return CreateOrderResponse(success=True, orderId=order_id)
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +311,12 @@ async def get_order(
     raw_bids = await bids_cursor.to_list(None)
     bids_out = [_bid_to_out(b) for b in raw_bids]
 
-    detail = _order_detail(order, bids_out, is_staff=(role == "staff"))
+    detail = _order_detail(
+        order,
+        bids_out,
+        is_staff=(role == "staff"),
+        viewer_aggregator_id=user["userId"] if role == "aggregator" else None,
+    )
     return detail
 
 
@@ -299,7 +334,6 @@ async def order_stream(
     db = get_db()
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        # Immediately send current bids
         order = await check_and_close_bidding(order_id, db)
         bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
         raw_bids = await bids_cursor.to_list(None)
@@ -364,7 +398,6 @@ async def place_bid(
     if now >= bidding_ends:
         raise HTTPException(status_code=400, detail="Bidding session has expired")
 
-    # Upsert: update existing bid from this aggregator, or insert new one
     bid_doc = {
         "orderId": order_id,
         "aggregatorId": agg_user["userId"],
@@ -379,7 +412,6 @@ async def place_bid(
         upsert=True,
     )
 
-    # Fetch all bids for this order sorted by totalPrice asc
     bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
     raw_bids = await bids_cursor.to_list(None)
     import json
@@ -401,16 +433,15 @@ async def place_bid(
 
 
 # ---------------------------------------------------------------------------
-# POST /api/orders/{id}/verify-collection  (aggregator only)
+# POST /api/orders/{id}/accept  (winner aggregator only)
 # ---------------------------------------------------------------------------
 
-@router.post("/orders/{order_id}/verify-collection")
-async def verify_collection(
+@router.post("/orders/{order_id}/accept")
+async def accept_order(
     order_id: str,
-    body: VerifyCollectionRequest,
     aggregator_session: str | None = Cookie(default=None),
 ):
-    _require_aggregator(aggregator_session)
+    agg_user = _require_aggregator(aggregator_session)
     db = get_db()
 
     order = await db.orders.find_one({"_id": ObjectId(order_id)})
@@ -420,48 +451,105 @@ async def verify_collection(
     if order.get("status") != "awaiting_fulfillment":
         raise HTTPException(status_code=400, detail="Order is not awaiting fulfillment")
 
-    expected = order.get("collectionCode", "")
-    if body.code.strip().upper() != expected:
-        raise HTTPException(status_code=400, detail="Invalid collection code")
+    if order.get("winnerId") != agg_user["userId"]:
+        raise HTTPException(status_code=403, detail="Only the winning aggregator can accept this order")
 
     await db.orders.update_one(
         {"_id": ObjectId(order_id)},
-        {"$set": {"status": "collection_verified"}},
+        {"$set": {"status": "accepted"}},
     )
-    await sse_manager.broadcast(order_id, "collection_verified", {})
+    await sse_manager.broadcast(order_id, "order_accepted", {"aggregatorName": agg_user["name"]})
+
+    # Notify enrollee via Klaire
+    enrollee = order.get("enrollee", {})
+    phone = enrollee.get("phone")
+    if phone:
+        asyncio.create_task(notify_order_accepted(
+            phone=phone,
+            enrollee_id=enrollee.get("enrolleeId", ""),
+            enrollee_name=enrollee.get("fullName", ""),
+            pharmacy_name=agg_user["name"],
+            order_id=order_id,
+        ))
 
     return {"success": True}
 
 
 # ---------------------------------------------------------------------------
-# POST /api/orders/{id}/generate-approval  (staff only)
+# POST /api/orders/{id}/fulfill  (winner aggregator only)
 # ---------------------------------------------------------------------------
 
-@router.post("/orders/{order_id}/generate-approval", response_model=ApprovalResponse)
-async def generate_approval(
+@router.post("/orders/{order_id}/fulfill")
+async def fulfill_order(
     order_id: str,
-    staff_session: str | None = Cookie(default=None),
+    aggregator_session: str | None = Cookie(default=None),
 ):
-    _require_staff(staff_session)
+    agg_user = _require_aggregator(aggregator_session)
     db = get_db()
 
     order = await db.orders.find_one({"_id": ObjectId(order_id)})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    if order.get("status") != "collection_verified":
-        raise HTTPException(
-            status_code=400,
-            detail="Order must be in collection_verified status to generate approval",
-        )
+    if order.get("status") != "accepted":
+        raise HTTPException(status_code=400, detail="Order must be in accepted status to mark as fulfilled")
 
-    approval_code = generate_code(8)
+    if order.get("winnerId") != agg_user["userId"]:
+        raise HTTPException(status_code=403, detail="Only the winning aggregator can fulfill this order")
+
     await db.orders.update_one(
         {"_id": ObjectId(order_id)},
-        {"$set": {"approvalCode": approval_code, "status": "fulfilled"}},
+        {"$set": {"status": "awaiting_confirmation"}},
     )
-    await sse_manager.broadcast(
-        order_id, "approval_generated", {"approvalCode": approval_code}
-    )
+    await sse_manager.broadcast(order_id, "order_fulfilled", {})
 
-    return ApprovalResponse(success=True, approvalCode=approval_code)
+    # Ask enrollee via Klaire if they received their medication
+    enrollee = order.get("enrollee", {})
+    phone = enrollee.get("phone")
+    if phone:
+        asyncio.create_task(notify_order_fulfilled(
+            phone=phone,
+            enrollee_id=enrollee.get("enrolleeId", ""),
+            enrollee_name=enrollee.get("fullName", ""),
+            pharmacy_name=agg_user["name"],
+            medications=_med_names(order),
+            order_id=order_id,
+        ))
+
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/orders/{id}/klaire-callback  (called by Klaire WhatsApp service)
+# ---------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/klaire-callback")
+async def klaire_callback(
+    order_id: str,
+    body: KlaireCallbackRequest,
+    request: Request,
+):
+    db = get_db()
+
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.get("status") != "awaiting_confirmation":
+        # Idempotent — if already resolved, just return ok
+        return {"success": True, "note": "order already resolved"}
+
+    if body.received:
+        new_status = "completed"
+        event = "order_completed"
+    else:
+        new_status = "not_received"
+        event = "order_not_received"
+
+    await db.orders.update_one(
+        {"_id": ObjectId(order_id)},
+        {"$set": {"status": new_status}},
+    )
+    await sse_manager.broadcast(order_id, event, {"received": body.received})
+
+    return {"success": True}

@@ -60,6 +60,36 @@ async def search_members(
     }
 
 
+@router.get("/members/{enrollee_id}")
+async def get_member_detail(
+    enrollee_id: str,
+    staff_session: str | None = Cookie(default=None),
+):
+    """Return phone and address for an enrollee by ID (for pharmacy intake form auto-fill)."""
+    _require_staff(staff_session)
+    _check_md()
+    # Try to fetch phone1 and address1; fall back gracefully if address1 column doesn't exist.
+    try:
+        rows = await md_query(
+            'SELECT phone1, address1 FROM "AI DRIVEN DATA"."MEMBER" WHERE legacycode = ? LIMIT 1',
+            [enrollee_id],
+        )
+        phone = rows[0].get("phone1") if rows else None
+        address = rows[0].get("address1") if rows else None
+    except Exception:
+        try:
+            rows = await md_query(
+                'SELECT phone1 FROM "AI DRIVEN DATA"."MEMBER" WHERE legacycode = ? LIMIT 1',
+                [enrollee_id],
+            )
+            phone = rows[0].get("phone1") if rows else None
+            address = None
+        except Exception:
+            phone = None
+            address = None
+    return {"phone": phone or None, "address": address or None}
+
+
 # ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
