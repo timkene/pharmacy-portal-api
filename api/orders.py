@@ -86,20 +86,32 @@ def _bid_to_out(bid: dict) -> BidOut:
 
 
 def _order_summary(order: dict, bid_count: int) -> OrderSummary:
-    meds = order.get("medications", [])
-    diagnosis = meds[0].get("diagnosis", "—") if meds else "—"
-    enrollee = order.get("enrollee", {})
-    full_name = enrollee.get("fullName") or (
-        f"{enrollee.get('firstname', '')} {enrollee.get('lastname', '')}".strip()
+    meds_raw = order.get("medications", [])
+    enrollee_raw = order.get("enrollee", {})
+    full_name = enrollee_raw.get("fullName") or (
+        f"{enrollee_raw.get('firstname', '')} {enrollee_raw.get('lastname', '')}".strip()
     ) or "—"
+    enrollee = Enrollee(
+        enrolleeId=enrollee_raw.get("enrolleeId", ""),
+        fullName=full_name,
+        phone=enrollee_raw.get("phone"),
+        address=enrollee_raw.get("address"),
+    )
+    medications = []
+    for m in meds_raw:
+        try:
+            medications.append(Medication(**m))
+        except Exception:
+            pass
     return OrderSummary(
         id=str(order["_id"]),
-        intakeId=order["intakeId"],
-        enrolleeFullName=full_name,
-        diagnosis=diagnosis,
-        status=order["status"],
-        biddingEndsAt=order["biddingEndsAt"],
-        createdAt=order["createdAt"],
+        intakeId=order.get("intakeId", ""),
+        enrollee=enrollee,
+        medications=medications,
+        diagnosis=meds_raw[0].get("diagnosis") if meds_raw else None,
+        status=order.get("status", "bidding"),
+        biddingEndsAt=order.get("biddingEndsAt", datetime.now(timezone.utc)),
+        createdAt=order.get("createdAt", datetime.now(timezone.utc)),
         bidCount=bid_count,
     )
 

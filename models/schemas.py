@@ -86,8 +86,9 @@ class BidOut(BaseModel):
 class OrderSummary(BaseModel):
     id: str
     intakeId: str
-    enrolleeFullName: str
-    diagnosis: str
+    enrollee: Enrollee
+    medications: List[Medication] = []
+    diagnosis: Optional[str] = None
     status: str
     biddingEndsAt: datetime
     createdAt: datetime
