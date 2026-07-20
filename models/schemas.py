@@ -80,6 +80,7 @@ class BidOut(BaseModel):
     aggregatorName: str
     unitPrice: float
     totalPrice: float
+    isCheapest: bool = False
     submittedAt: datetime
 
 

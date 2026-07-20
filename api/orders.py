@@ -73,7 +73,7 @@ def _require_any(staff_session: str | None, aggregator_session: str | None) -> t
 # Serialisation helpers
 # ---------------------------------------------------------------------------
 
-def _bid_to_out(bid: dict) -> BidOut:
+def _bid_to_out(bid: dict, *, is_cheapest: bool = False) -> BidOut:
     return BidOut(
         id=str(bid["_id"]),
         orderId=bid["orderId"],
@@ -81,6 +81,7 @@ def _bid_to_out(bid: dict) -> BidOut:
         aggregatorName=bid["aggregatorName"],
         unitPrice=bid["unitPrice"],
         totalPrice=bid["totalPrice"],
+        isCheapest=is_cheapest,
         submittedAt=bid["submittedAt"],
     )
 
@@ -321,7 +322,8 @@ async def get_order(
 
     bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
     raw_bids = await bids_cursor.to_list(None)
-    bids_out = [_bid_to_out(b) for b in raw_bids]
+    cheapest_id = str(raw_bids[0]["_id"]) if raw_bids else None
+    bids_out = [_bid_to_out(b, is_cheapest=(str(b["_id"]) == cheapest_id)) for b in raw_bids]
 
     detail = _order_detail(
         order,
@@ -426,7 +428,7 @@ async def place_bid(
 
     bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
     raw_bids = await bids_cursor.to_list(None)
-    import json
+    cheapest_id = str(raw_bids[0]["_id"]) if raw_bids else None
     bids_payload = [
         {
             "id": str(b["_id"]),
@@ -435,6 +437,7 @@ async def place_bid(
             "aggregatorName": b["aggregatorName"],
             "unitPrice": b["unitPrice"],
             "totalPrice": b["totalPrice"],
+            "isCheapest": str(b["_id"]) == cheapest_id,
             "submittedAt": b["submittedAt"].isoformat(),
         }
         for b in raw_bids
