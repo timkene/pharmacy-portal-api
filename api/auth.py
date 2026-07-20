@@ -112,22 +112,3 @@ async def logout(response: Response):
     response.delete_cookie("staff_session")
     response.delete_cookie("aggregator_session")
     return {"success": True}
-
-
-# ---------------------------------------------------------------------------
-# Temporary staff upsert — remove after use
-# ---------------------------------------------------------------------------
-
-@router.post("/staff/upsert")
-async def staff_upsert(body: StaffLoginRequest):
-    import os
-    if os.getenv("ENVIRONMENT") == "production" and os.getenv("ADMIN_SECRET") != body.password[:8]:
-        pass  # allow regardless — this is a one-time setup endpoint
-    db = get_db()
-    new_hash = hash_password(body.password)
-    result = await db.staff_users.update_one(
-        {"email": body.email},
-        {"$set": {"email": body.email, "name": "Admin", "password_hash": new_hash}},
-        upsert=True,
-    )
-    return {"upserted": result.upserted_id is not None, "modified": result.modified_count}
