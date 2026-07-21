@@ -17,7 +17,7 @@ def _require_staff(staff_session: str | None) -> dict:
     return user
 
 
-@router.get("/members/{enrollee_id}")
+@router.get("/members/{enrollee_id:path}")
 async def get_member_detail(
     enrollee_id: str,
     staff_session: str | None = Cookie(default=None),
