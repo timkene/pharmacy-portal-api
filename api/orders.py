@@ -306,6 +306,24 @@ async def create_order(
 
 
 # ---------------------------------------------------------------------------
+# DELETE /api/orders/{id}  (staff only)
+# ---------------------------------------------------------------------------
+
+@router.delete("/orders/{order_id}", status_code=200)
+async def delete_order(
+    order_id: str,
+    staff_session: str | None = Cookie(default=None),
+):
+    _require_staff(staff_session)
+    db = get_db()
+    result = await db.orders.delete_one({"_id": ObjectId(order_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Order not found")
+    await db.bids.delete_many({"orderId": order_id})
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/orders/{id}  (staff or aggregator)
 # ---------------------------------------------------------------------------
 
