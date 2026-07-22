@@ -1,9 +1,10 @@
 import asyncio
+import os
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 from bson import ObjectId
-from fastapi import APIRouter, Cookie, HTTPException, Query, Request
+from fastapi import APIRouter, Cookie, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from core.database import get_db
@@ -14,6 +15,8 @@ from core.klaire_client import (
 )
 from core.security import decode_session, generate_intake_id
 from core.sse import sse_manager
+
+_PHARMACY_SERVICE_KEY = os.getenv("PHARMACY_SERVICE_KEY", "")
 from models.schemas import (
     BidOut,
     CreateOrderRequest,
@@ -38,7 +41,9 @@ BIDDING_WINDOW_MINUTES = 15
 # Session helpers
 # ---------------------------------------------------------------------------
 
-def _require_staff(staff_session: str | None) -> dict:
+def _require_staff(staff_session: str | None, x_service_key: str = "") -> dict:
+    if _PHARMACY_SERVICE_KEY and x_service_key == _PHARMACY_SERVICE_KEY:
+        return {"userId": "service", "name": "Clearline Analytics"}
     if not staff_session:
         raise HTTPException(status_code=401, detail="Staff authentication required")
     user = decode_session(staff_session)
@@ -56,8 +61,14 @@ def _require_aggregator(aggregator_session: str | None) -> dict:
     return user
 
 
-def _require_any(staff_session: str | None, aggregator_session: str | None) -> tuple[dict, str]:
+def _require_any(
+    staff_session: str | None,
+    aggregator_session: str | None,
+    x_service_key: str = "",
+) -> tuple[dict, str]:
     """Return (user_dict, role) where role is 'staff' or 'aggregator'."""
+    if _PHARMACY_SERVICE_KEY and x_service_key == _PHARMACY_SERVICE_KEY:
+        return {"userId": "service", "name": "Clearline Analytics"}, "staff"
     if staff_session:
         user = decode_session(staff_session)
         if user:
@@ -241,8 +252,9 @@ async def list_orders(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
 ):
-    _require_staff(staff_session)
+    _require_staff(staff_session, x_service_key)
     db = get_db()
 
     skip = (page - 1) * limit
@@ -280,8 +292,9 @@ async def list_orders(
 async def create_order(
     body: CreateOrderRequest,
     staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
 ):
-    staff_user = _require_staff(staff_session)
+    staff_user = _require_staff(staff_session, x_service_key)
     db = get_db()
 
     from datetime import timedelta
@@ -327,8 +340,9 @@ async def create_order(
 async def delete_order(
     order_id: str,
     staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
 ):
-    _require_staff(staff_session)
+    _require_staff(staff_session, x_service_key)
     db = get_db()
     result = await db.orders.delete_one({"_id": ObjectId(order_id)})
     if result.deleted_count == 0:
@@ -346,8 +360,9 @@ async def get_order(
     order_id: str,
     staff_session: str | None = Cookie(default=None),
     aggregator_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
 ):
-    user, role = _require_any(staff_session, aggregator_session)
+    user, role = _require_any(staff_session, aggregator_session, x_service_key)
     db = get_db()
 
     order = await check_and_close_bidding(order_id, db)
@@ -375,8 +390,9 @@ async def order_stream(
     order_id: str,
     staff_session: str | None = Cookie(default=None),
     aggregator_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
 ):
-    _require_any(staff_session, aggregator_session)
+    _require_any(staff_session, aggregator_session, x_service_key)
     db = get_db()
 
     async def event_generator() -> AsyncGenerator[str, None]:
