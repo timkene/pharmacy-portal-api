@@ -21,6 +21,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://pharmacy-portal-delta.vercel.app",
+        "https://cil-frontend.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
