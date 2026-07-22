@@ -93,6 +93,7 @@ class OrderSummary(BaseModel):
     status: str
     biddingEndsAt: datetime
     createdAt: datetime
+    completedAt: Optional[datetime] = None
     bidCount: int
 
 

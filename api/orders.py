@@ -86,7 +86,7 @@ def _bid_to_out(bid: dict, *, is_cheapest: bool = False) -> BidOut:
     )
 
 
-def _order_summary(order: dict, bid_count: int) -> OrderSummary:
+def _order_summary(order: dict, bid_count: int = 0) -> OrderSummary:
     meds_raw = order.get("medications", [])
     enrollee_raw = order.get("enrollee", {})
     full_name = enrollee_raw.get("fullName") or (
@@ -113,7 +113,8 @@ def _order_summary(order: dict, bid_count: int) -> OrderSummary:
         status=order.get("status", "bidding"),
         biddingEndsAt=order.get("biddingEndsAt", datetime.now(timezone.utc)),
         createdAt=order.get("createdAt", datetime.now(timezone.utc)),
-        bidCount=bid_count,
+        completedAt=order.get("completedAt"),
+        bidCount=order.get("bidCount", bid_count),
     )
 
 
@@ -246,14 +247,27 @@ async def list_orders(
 
     skip = (page - 1) * limit
     total = await db.orders.count_documents({})
-    cursor = db.orders.find({}).sort("createdAt", -1).skip(skip).limit(limit)
-    raw_orders = await cursor.to_list(limit)
 
-    summaries = []
-    for order in raw_orders:
-        order_id_str = str(order["_id"])
-        bid_count = await db.bids.count_documents({"orderId": order_id_str})
-        summaries.append(_order_summary(order, bid_count))
+    # Single aggregation — no N+1 bid count queries
+    pipeline = [
+        {"$sort": {"createdAt": -1}},
+        {"$skip": skip},
+        {"$limit": limit},
+        {"$addFields": {"_id_str": {"$toString": "$_id"}}},
+        {
+            "$lookup": {
+                "from": "bids",
+                "localField": "_id_str",
+                "foreignField": "orderId",
+                "as": "_bid_agg",
+                "pipeline": [{"$count": "n"}],
+            }
+        },
+        {"$addFields": {"bidCount": {"$ifNull": [{"$first": "$_bid_agg.n"}, 0]}}},
+        {"$unset": ["_bid_agg", "_id_str"]},
+    ]
+    raw_orders = await db.orders.aggregate(pipeline).to_list(limit)
+    summaries = [_order_summary(order) for order in raw_orders]
 
     return OrderListResponse(orders=summaries, total=total, page=page)
 
@@ -572,6 +586,7 @@ async def klaire_callback(
         # Idempotent — if already resolved, just return ok
         return {"success": True, "note": "order already resolved"}
 
+    now = datetime.now(timezone.utc)
     if body.received:
         new_status = "completed"
         event = "order_completed"
@@ -581,7 +596,7 @@ async def klaire_callback(
 
     await db.orders.update_one(
         {"_id": ObjectId(order_id)},
-        {"$set": {"status": new_status}},
+        {"$set": {"status": new_status, "completedAt": now}},
     )
     await sse_manager.broadcast(order_id, event, {"received": body.received})
 
