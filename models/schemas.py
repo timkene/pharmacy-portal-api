@@ -48,6 +48,15 @@ class Enrollee(BaseModel):
     fullName: str
     phone: Optional[str] = None
     address: Optional[str] = None
+    title: Optional[str] = None
+    gender: Optional[str] = None
+    dateOfBirth: Optional[str] = None
+    planType: Optional[str] = None
+    groupName: Optional[str] = None
+    email: Optional[str] = None
+    effectiveDate: Optional[str] = None
+    terminationDate: Optional[str] = None
+    isterminated: Optional[bool] = None
 
 
 class Provider(BaseModel):

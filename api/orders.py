@@ -110,6 +110,15 @@ def _order_summary(order: dict, bid_count: int = 0) -> OrderSummary:
         fullName=full_name,
         phone=enrollee_raw.get("phone"),
         address=enrollee_raw.get("address"),
+        title=enrollee_raw.get("title"),
+        gender=enrollee_raw.get("gender"),
+        dateOfBirth=enrollee_raw.get("dateOfBirth"),
+        planType=enrollee_raw.get("planType"),
+        groupName=enrollee_raw.get("groupName"),
+        email=enrollee_raw.get("email"),
+        effectiveDate=enrollee_raw.get("effectiveDate"),
+        terminationDate=enrollee_raw.get("terminationDate"),
+        isterminated=enrollee_raw.get("isterminated"),
     )
     medications = []
     for m in meds_raw:
@@ -153,6 +162,15 @@ def _order_detail(
             fullName=enrollee_raw.get("fullName", ""),
             phone=enrollee_raw.get("phone"),
             address=enrollee_raw.get("address"),
+            title=enrollee_raw.get("title"),
+            gender=enrollee_raw.get("gender"),
+            dateOfBirth=enrollee_raw.get("dateOfBirth"),
+            planType=enrollee_raw.get("planType"),
+            groupName=enrollee_raw.get("groupName"),
+            email=enrollee_raw.get("email"),
+            effectiveDate=enrollee_raw.get("effectiveDate"),
+            terminationDate=enrollee_raw.get("terminationDate"),
+            isterminated=enrollee_raw.get("isterminated"),
         )
     else:
         # Non-winner aggregators see name and address only — no ID or phone
