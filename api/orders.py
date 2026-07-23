@@ -12,6 +12,7 @@ from core.klaire_client import (
     notify_order_accepted,
     notify_order_created,
     notify_order_fulfilled,
+    notify_order_picked_up,
 )
 from core.security import decode_session, generate_intake_id
 from core.sse import sse_manager
@@ -754,7 +755,7 @@ async def fulfill_order(
                 order_id=order_id,
             ))
     else:
-        # picked_up — closes immediately, no Klaire confirmation needed
+        # picked_up — closes immediately; Klaire notifies enrollee as a receipt
         await db.orders.update_one(
             {"_id": ObjectId(order_id)},
             {"$set": {
@@ -764,6 +765,15 @@ async def fulfill_order(
             }},
         )
         await sse_manager.broadcast(order_id, "order_completed", {"received": True})
+        if phone:
+            asyncio.create_task(notify_order_picked_up(
+                phone=phone,
+                enrollee_id=enrollee.get("enrolleeId", ""),
+                enrollee_name=enrollee.get("fullName", ""),
+                pharmacy_name=agg_user["name"],
+                medications=_med_names(order),
+                order_id=order_id,
+            ))
 
     return {"success": True}
 

@@ -74,3 +74,21 @@ async def notify_order_fulfilled(
         "medications": medications,
         "order_id": order_id,
     })
+
+
+async def notify_order_picked_up(
+    phone: str,
+    enrollee_id: str,
+    enrollee_name: str,
+    pharmacy_name: str,
+    medications: list[str],
+    order_id: str,
+) -> None:
+    await _post("order_picked_up", {
+        "phone": phone,
+        "enrollee_id": enrollee_id,
+        "enrollee_name": enrollee_name,
+        "pharmacy_name": pharmacy_name,
+        "medications": medications,
+        "order_id": order_id,
+    })
