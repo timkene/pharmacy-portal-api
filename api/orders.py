@@ -475,6 +475,38 @@ async def update_order(
 
 
 # ---------------------------------------------------------------------------
+# POST /api/orders/{id}/close-bidding  (staff only — force-close early)
+# ---------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/close-bidding")
+async def close_bidding_early(
+    order_id: str,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    db = get_db()
+
+    from datetime import timedelta
+
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.get("status") != "bidding":
+        raise HTTPException(status_code=400, detail="Order is not in bidding status")
+
+    # Move biddingEndsAt into the past so check_and_close_bidding triggers immediately
+    now = datetime.now(timezone.utc)
+    await db.orders.update_one(
+        {"_id": ObjectId(order_id)},
+        {"$set": {"biddingEndsAt": now - timedelta(seconds=1)}},
+    )
+    await check_and_close_bidding(order_id, db)
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/orders/{id}  (staff or aggregator)
 # ---------------------------------------------------------------------------
 
