@@ -813,3 +813,36 @@ async def klaire_callback(
     await sse_manager.broadcast(order_id, event, {"received": body.received})
 
     return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/orders/{id}/staff-confirm  (staff manually confirms receipt)
+# ---------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/staff-confirm")
+async def staff_confirm_receipt(
+    order_id: str,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str | None = Header(default=None),
+):
+    _require_staff(staff_session, x_service_key)
+    db = get_db()
+
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.get("status") != "awaiting_confirmation":
+        raise HTTPException(
+            status_code=400,
+            detail="Order must be awaiting confirmation to manually confirm receipt",
+        )
+
+    now = datetime.now(timezone.utc)
+    await db.orders.update_one(
+        {"_id": ObjectId(order_id)},
+        {"$set": {"status": "completed", "completedAt": now}},
+    )
+    await sse_manager.broadcast(order_id, "order_completed", {"received": True})
+
+    return {"success": True}
