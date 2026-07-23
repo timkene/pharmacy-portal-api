@@ -95,6 +95,8 @@ class OrderSummary(BaseModel):
     createdAt: datetime
     completedAt: Optional[datetime] = None
     bidCount: int
+    winnerName: Optional[str] = None
+    winnerTotalPrice: Optional[float] = None
 
 
 class OrderDetail(BaseModel):

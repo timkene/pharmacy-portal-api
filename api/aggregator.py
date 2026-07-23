@@ -29,6 +29,41 @@ def _serialize_order(order: dict) -> dict:
     return out
 
 
+@router.get("/aggregator/orders")
+async def aggregator_orders_list(
+    aggregator_session: str | None = Cookie(default=None),
+):
+    """All orders relevant to this aggregator — open sessions, active won orders, fulfilled."""
+    agg_user = _require_aggregator(aggregator_session)
+    agg_id = agg_user["userId"]
+    db = get_db()
+
+    open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
+    open_orders = [_serialize_order(o) async for o in open_cursor]
+
+    active_statuses = ["awaiting_fulfillment", "accepted", "awaiting_confirmation"]
+    active_cursor = db.orders.find(
+        {"winnerId": agg_id, "status": {"$in": active_statuses}}
+    ).sort("createdAt", -1)
+    active_orders = [_serialize_order(o) async for o in active_cursor]
+
+    fulfilled_cursor = db.orders.find(
+        {"winnerId": agg_id, "status": "completed"}
+    ).sort("createdAt", -1)
+    fulfilled_orders = [_serialize_order(o) async for o in fulfilled_cursor]
+
+    return {
+        "open": open_orders,
+        "active": active_orders,
+        "fulfilled": fulfilled_orders,
+        "counts": {
+            "open": len(open_orders),
+            "active": len(active_orders),
+            "fulfilled": len(fulfilled_orders),
+        },
+    }
+
+
 @router.get("/aggregator/dashboard")
 async def aggregator_dashboard(
     aggregator_session: str | None = Cookie(default=None),

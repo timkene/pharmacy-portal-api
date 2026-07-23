@@ -126,6 +126,8 @@ def _order_summary(order: dict, bid_count: int = 0) -> OrderSummary:
         createdAt=order.get("createdAt", datetime.now(timezone.utc)),
         completedAt=order.get("completedAt"),
         bidCount=order.get("bidCount", bid_count),
+        winnerName=order.get("winnerName"),
+        winnerTotalPrice=order.get("winnerTotalPrice"),
     )
 
 
@@ -166,9 +168,9 @@ def _order_detail(
         medications=[Medication(**m) for m in order["medications"]],
         biddingEndsAt=order["biddingEndsAt"],
         status=order["status"],
-        winnerId=winner_id,
-        winnerName=order.get("winnerName"),
-        winnerTotalPrice=order.get("winnerTotalPrice"),
+        winnerId=winner_id if is_staff else None,
+        winnerName=order.get("winnerName") if (is_staff or is_winner) else None,
+        winnerTotalPrice=order.get("winnerTotalPrice") if (is_staff or is_winner) else None,
         createdAt=order["createdAt"],
         createdBy=order["createdBy"],
         bids=bids,
@@ -371,6 +373,14 @@ async def get_order(
     raw_bids = await bids_cursor.to_list(None)
     cheapest_id = str(raw_bids[0]["_id"]) if raw_bids else None
     bids_out = [_bid_to_out(b, is_cheapest=(str(b["_id"]) == cheapest_id)) for b in raw_bids]
+
+    # Aggregators only see their own bid — never competitor bids or isCheapest flag
+    if role == "aggregator":
+        agg_id = user["userId"]
+        bids_out = [
+            BidOut(**{**b.model_dump(), "isCheapest": False})
+            for b in bids_out if b.aggregatorId == agg_id
+        ]
 
     detail = _order_detail(
         order,
