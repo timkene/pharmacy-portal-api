@@ -91,12 +91,14 @@ class OrderSummary(BaseModel):
     medications: List[Medication] = []
     diagnosis: Optional[str] = None
     status: str
-    biddingEndsAt: datetime
+    biddingEndsAt: Optional[datetime] = None
     createdAt: datetime
     completedAt: Optional[datetime] = None
     bidCount: int
     winnerName: Optional[str] = None
     winnerTotalPrice: Optional[float] = None
+    fulfillmentType: Optional[str] = None
+    deliveryFee: Optional[float] = None
 
 
 class OrderDetail(BaseModel):
@@ -105,11 +107,13 @@ class OrderDetail(BaseModel):
     enrollee: Enrollee
     provider: Optional[Provider] = None
     medications: List[Medication]
-    biddingEndsAt: datetime
+    biddingEndsAt: Optional[datetime] = None
     status: str
     winnerId: Optional[str] = None
     winnerName: Optional[str] = None
     winnerTotalPrice: Optional[float] = None
+    fulfillmentType: Optional[str] = None
+    deliveryFee: Optional[float] = None
     createdAt: datetime
     createdBy: str
     bids: List[BidOut] = []
@@ -133,6 +137,17 @@ class CreateOrderResponse(BaseModel):
 class PlaceBidRequest(BaseModel):
     unitPrice: float
     totalPrice: float
+
+
+class FulfillOrderRequest(BaseModel):
+    fulfillmentType: str  # 'delivered' or 'picked_up'
+    deliveryFee: Optional[float] = None
+
+
+class UpdateOrderRequest(BaseModel):
+    enrollee: Optional[Enrollee] = None
+    provider: Optional[Provider] = None
+    medications: Optional[List[Medication]] = None
 
 
 # ---------------------------------------------------------------------------

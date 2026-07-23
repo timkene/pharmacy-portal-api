@@ -22,6 +22,7 @@ from models.schemas import (
     CreateOrderRequest,
     CreateOrderResponse,
     Enrollee,
+    FulfillOrderRequest,
     KlaireCallbackRequest,
     Medication,
     OrderDetail,
@@ -29,12 +30,13 @@ from models.schemas import (
     OrderSummary,
     PlaceBidRequest,
     Provider,
+    UpdateOrderRequest,
 )
 
 router = APIRouter(tags=["orders"])
 
 KEEPALIVE_INTERVAL = 15  # seconds
-BIDDING_WINDOW_MINUTES = 15
+BIDDING_WINDOW_MINUTES = 60
 
 
 # ---------------------------------------------------------------------------
@@ -121,13 +123,15 @@ def _order_summary(order: dict, bid_count: int = 0) -> OrderSummary:
         enrollee=enrollee,
         medications=medications,
         diagnosis=meds_raw[0].get("diagnosis") if meds_raw else None,
-        status=order.get("status", "bidding"),
-        biddingEndsAt=order.get("biddingEndsAt", datetime.now(timezone.utc)),
+        status=order.get("status", "pending_review"),
+        biddingEndsAt=order.get("biddingEndsAt"),
         createdAt=order.get("createdAt", datetime.now(timezone.utc)),
         completedAt=order.get("completedAt"),
         bidCount=order.get("bidCount", bid_count),
         winnerName=order.get("winnerName"),
         winnerTotalPrice=order.get("winnerTotalPrice"),
+        fulfillmentType=order.get("fulfillmentType"),
+        deliveryFee=order.get("deliveryFee"),
     )
 
 
@@ -166,11 +170,13 @@ def _order_detail(
         enrollee=enrollee,
         provider=provider,
         medications=[Medication(**m) for m in order["medications"]],
-        biddingEndsAt=order["biddingEndsAt"],
+        biddingEndsAt=order.get("biddingEndsAt"),
         status=order["status"],
         winnerId=winner_id if is_staff else None,
         winnerName=order.get("winnerName") if (is_staff or is_winner) else None,
         winnerTotalPrice=order.get("winnerTotalPrice") if (is_staff or is_winner) else None,
+        fulfillmentType=order.get("fulfillmentType"),
+        deliveryFee=order.get("deliveryFee") if is_staff else None,
         createdAt=order["createdAt"],
         createdBy=order["createdBy"],
         bids=bids,
@@ -299,16 +305,13 @@ async def create_order(
     staff_user = _require_staff(staff_session, x_service_key)
     db = get_db()
 
-    from datetime import timedelta
-
     now = datetime.now(timezone.utc)
     doc = {
         "intakeId": generate_intake_id(),
         "enrollee": body.enrollee.model_dump(),
         "provider": body.provider.model_dump(),
         "medications": [m.model_dump() for m in body.medications],
-        "biddingEndsAt": now + timedelta(minutes=BIDDING_WINDOW_MINUTES),
-        "status": "bidding",
+        "status": "pending_review",
         "winnerId": None,
         "winnerName": None,
         "winnerTotalPrice": None,
@@ -318,18 +321,6 @@ async def create_order(
 
     result = await db.orders.insert_one(doc)
     order_id = str(result.inserted_id)
-
-    # Notify enrollee via Klaire if they have a phone number
-    phone = body.enrollee.phone
-    if phone:
-        med_names = [m.name for m in body.medications if m.name]
-        asyncio.create_task(notify_order_created(
-            phone=phone,
-            enrollee_id=body.enrollee.enrolleeId,
-            enrollee_name=body.enrollee.fullName,
-            medications=med_names,
-            order_id=order_id,
-        ))
 
     return CreateOrderResponse(success=True, orderId=order_id)
 
@@ -350,6 +341,118 @@ async def delete_order(
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
     await db.bids.delete_many({"orderId": order_id})
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/orders/{id}/approve  (staff only)
+# ---------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/approve")
+async def approve_order(
+    order_id: str,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    db = get_db()
+
+    from datetime import timedelta
+
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.get("status") != "pending_review":
+        raise HTTPException(status_code=400, detail="Order is not pending review")
+
+    now = datetime.now(timezone.utc)
+    await db.orders.update_one(
+        {"_id": ObjectId(order_id)},
+        {"$set": {
+            "status": "bidding",
+            "biddingEndsAt": now + timedelta(minutes=BIDDING_WINDOW_MINUTES),
+        }},
+    )
+
+    # Notify enrollee via Klaire that their order has been received
+    enrollee = order.get("enrollee", {})
+    phone = enrollee.get("phone")
+    if phone:
+        asyncio.create_task(notify_order_created(
+            phone=phone,
+            enrollee_id=enrollee.get("enrolleeId", ""),
+            enrollee_name=enrollee.get("fullName", ""),
+            medications=_med_names(order),
+            order_id=order_id,
+        ))
+
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/orders/{id}/reject  (staff only)
+# ---------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/reject")
+async def reject_order(
+    order_id: str,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    db = get_db()
+
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.get("status") != "pending_review":
+        raise HTTPException(status_code=400, detail="Order is not pending review")
+
+    await db.orders.update_one(
+        {"_id": ObjectId(order_id)},
+        {"$set": {"status": "rejected"}},
+    )
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/orders/{id}  (staff only — edit pending_review or rejected orders)
+# ---------------------------------------------------------------------------
+
+@router.put("/orders/{order_id}")
+async def update_order(
+    order_id: str,
+    body: UpdateOrderRequest,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    db = get_db()
+
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.get("status") not in ("pending_review", "rejected"):
+        raise HTTPException(status_code=400, detail="Only pending or rejected orders can be edited")
+
+    patch: dict = {}
+    if body.enrollee is not None:
+        patch["enrollee"] = body.enrollee.model_dump()
+    if body.provider is not None:
+        patch["provider"] = body.provider.model_dump()
+    if body.medications is not None:
+        patch["medications"] = [m.model_dump() for m in body.medications]
+
+    # Editing a rejected order moves it back to pending_review for re-review
+    if order.get("status") == "rejected":
+        patch["status"] = "pending_review"
+
+    if patch:
+        await db.orders.update_one({"_id": ObjectId(order_id)}, {"$set": patch})
+
     return {"success": True}
 
 
@@ -555,6 +658,7 @@ async def accept_order(
 @router.post("/orders/{order_id}/fulfill")
 async def fulfill_order(
     order_id: str,
+    body: FulfillOrderRequest | None = None,
     aggregator_session: str | None = Cookie(default=None),
 ):
     agg_user = _require_aggregator(aggregator_session)
@@ -570,24 +674,46 @@ async def fulfill_order(
     if order.get("winnerId") != agg_user["userId"]:
         raise HTTPException(status_code=403, detail="Only the winning aggregator can fulfill this order")
 
-    await db.orders.update_one(
-        {"_id": ObjectId(order_id)},
-        {"$set": {"status": "awaiting_confirmation"}},
-    )
-    await sse_manager.broadcast(order_id, "order_fulfilled", {})
+    fulfillment_type = (body.fulfillmentType if body else None) or "picked_up"
+    delivery_fee = body.deliveryFee if body else None
 
-    # Ask enrollee via Klaire if they received their medication
+    now = datetime.now(timezone.utc)
     enrollee = order.get("enrollee", {})
     phone = enrollee.get("phone")
-    if phone:
-        asyncio.create_task(notify_order_fulfilled(
-            phone=phone,
-            enrollee_id=enrollee.get("enrolleeId", ""),
-            enrollee_name=enrollee.get("fullName", ""),
-            pharmacy_name=agg_user["name"],
-            medications=_med_names(order),
-            order_id=order_id,
-        ))
+
+    if fulfillment_type == "delivered":
+        current_total = order.get("winnerTotalPrice") or 0
+        new_total = current_total + (delivery_fee or 0)
+        await db.orders.update_one(
+            {"_id": ObjectId(order_id)},
+            {"$set": {
+                "status": "awaiting_confirmation",
+                "fulfillmentType": "delivered",
+                "deliveryFee": delivery_fee,
+                "winnerTotalPrice": new_total,
+            }},
+        )
+        await sse_manager.broadcast(order_id, "order_fulfilled", {})
+        if phone:
+            asyncio.create_task(notify_order_fulfilled(
+                phone=phone,
+                enrollee_id=enrollee.get("enrolleeId", ""),
+                enrollee_name=enrollee.get("fullName", ""),
+                pharmacy_name=agg_user["name"],
+                medications=_med_names(order),
+                order_id=order_id,
+            ))
+    else:
+        # picked_up — closes immediately, no Klaire confirmation needed
+        await db.orders.update_one(
+            {"_id": ObjectId(order_id)},
+            {"$set": {
+                "status": "completed",
+                "fulfillmentType": "picked_up",
+                "completedAt": now,
+            }},
+        )
+        await sse_manager.broadcast(order_id, "order_completed", {"received": True})
 
     return {"success": True}
 
