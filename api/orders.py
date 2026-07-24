@@ -341,6 +341,17 @@ async def create_order(
     result = await db.orders.insert_one(doc)
     order_id = str(result.inserted_id)
 
+    try:
+        from ..core.push_manager import send_push
+        enrollee_name = getattr(body.enrollee, "fullName", None) or "Enrollee"
+        await send_push(
+            title="New Pharmacy Order",
+            body=f"{enrollee_name} — {len(body.medications)} medication(s) pending review",
+            url=f"/pharmacy/orders/{order_id}",
+        )
+    except Exception as _pe:
+        pass
+
     return CreateOrderResponse(success=True, orderId=order_id)
 
 
@@ -846,3 +857,45 @@ async def staff_confirm_receipt(
     await sse_manager.broadcast(order_id, "order_completed", {"received": True})
 
     return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# Push notification subscribe / unsubscribe (staff only)
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel as _BaseModel
+
+class _PushSubBody(_BaseModel):
+    endpoint: str
+    keys: dict
+    expirationTime: float | None = None
+
+
+@router.post("/push/subscribe")
+async def push_subscribe(
+    body: _PushSubBody,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    staff_user = _require_staff(staff_session, x_service_key)
+    from core.push_manager import save_subscription, VAPID_PUBLIC_KEY
+    await save_subscription({"endpoint": body.endpoint, "keys": body.keys}, staff_user.get("userId", "unknown"))
+    return {"status": "subscribed", "vapid_public_key": VAPID_PUBLIC_KEY}
+
+
+@router.post("/push/unsubscribe")
+async def push_unsubscribe(
+    body: _PushSubBody,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    from core.push_manager import remove_subscription
+    await remove_subscription(body.endpoint)
+    return {"status": "unsubscribed"}
+
+
+@router.get("/push/vapid-public-key")
+async def pharmacy_vapid_public_key():
+    from core.push_manager import VAPID_PUBLIC_KEY
+    return {"vapid_public_key": VAPID_PUBLIC_KEY}
