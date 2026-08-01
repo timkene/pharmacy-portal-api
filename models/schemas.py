@@ -175,3 +175,7 @@ class AggregatorDashboardResponse(BaseModel):
 
 class KlaireCallbackRequest(BaseModel):
     received: bool
+
+
+class ClearlineApproveRequest(BaseModel):
+    adjusted_price: Optional[float] = None

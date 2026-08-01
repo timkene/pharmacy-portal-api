@@ -20,6 +20,7 @@ from core.sse import sse_manager
 _PHARMACY_SERVICE_KEY = os.getenv("PHARMACY_SERVICE_KEY", "")
 from models.schemas import (
     BidOut,
+    ClearlineApproveRequest,
     CreateOrderRequest,
     CreateOrderResponse,
     Enrollee,
@@ -236,7 +237,7 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
     winning_bids = await bids_cursor.to_list(1)
 
     if not winning_bids:
-        update = {"$set": {"status": "awaiting_fulfillment"}}
+        update = {"$set": {"status": "clearline_price_review"}}
         await db.orders.update_one({"_id": ObjectId(order_id)}, update)
         order = await db.orders.find_one({"_id": ObjectId(order_id)})
         await sse_manager.broadcast(
@@ -249,7 +250,7 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
     winner = winning_bids[0]
     update = {
         "$set": {
-            "status": "awaiting_fulfillment",
+            "status": "clearline_price_review",
             "winnerId": winner["aggregatorId"],
             "winnerName": winner["aggregatorName"],
             "winnerTotalPrice": winner["totalPrice"],
@@ -258,6 +259,8 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
     await db.orders.update_one({"_id": ObjectId(order_id)}, update)
     order = await db.orders.find_one({"_id": ObjectId(order_id)})
 
+    # Broadcast bidding-closed so the live table stops; winner info is withheld
+    # from aggregators until Clearline approves via /clearline-approve.
     await sse_manager.broadcast(
         order_id,
         "session_closed",
@@ -515,6 +518,48 @@ async def close_bidding_early(
         {"$set": {"biddingEndsAt": now - timedelta(seconds=1)}},
     )
     await check_and_close_bidding(order_id, db)
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/orders/{id}/clearline-approve  (staff only)
+# Clearline pharmacy team reviews & optionally adjusts the winning price,
+# then releases the order to the aggregator for acceptance.
+# ---------------------------------------------------------------------------
+
+@router.post("/orders/{order_id}/clearline-approve")
+async def clearline_approve(
+    order_id: str,
+    body: ClearlineApproveRequest | None = None,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    db = get_db()
+
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.get("status") != "clearline_price_review":
+        raise HTTPException(status_code=400, detail="Order is not in Clearline price review")
+
+    patch: dict = {"status": "awaiting_fulfillment"}
+    if body and body.adjusted_price is not None:
+        patch["winnerTotalPrice"] = body.adjusted_price
+
+    await db.orders.update_one({"_id": ObjectId(order_id)}, {"$set": patch})
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+
+    await sse_manager.broadcast(
+        order_id,
+        "price_approved",
+        {
+            "winnerId": order.get("winnerId"),
+            "winnerName": order.get("winnerName"),
+            "totalPrice": order.get("winnerTotalPrice"),
+        },
+    )
     return {"success": True}
 
 
