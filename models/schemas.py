@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, StringConstraints
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +93,16 @@ class BidOut(BaseModel):
     submittedAt: datetime
 
 
+class RejectOrderRequest(BaseModel):
+    comment: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class AssignOrderRequest(BaseModel):
+    aggregatorId: str
+
+
 class OrderSummary(BaseModel):
+    reviewFlags: Optional[dict] = None
     id: str
     intakeId: str
     enrollee: Enrollee
@@ -108,9 +117,12 @@ class OrderSummary(BaseModel):
     winnerTotalPrice: Optional[float] = None
     fulfillmentType: Optional[str] = None
     deliveryFee: Optional[float] = None
+    assignmentType: Optional[str] = None
+    denialComment: Optional[str] = None
 
 
 class OrderDetail(BaseModel):
+    reviewFlags: Optional[dict] = None
     id: str
     intakeId: str
     enrollee: Enrollee
@@ -126,6 +138,10 @@ class OrderDetail(BaseModel):
     createdAt: datetime
     createdBy: str
     bids: List[BidOut] = []
+    assignmentType: Optional[str] = None
+    denialComment: Optional[str] = None
+    deniedBy: Optional[dict] = None
+    deniedAt: Optional[datetime] = None
 
 
 class OrderListResponse(BaseModel):
