@@ -22,6 +22,15 @@ def _serialize_order(order: dict) -> dict:
     # Remove fields aggregators should not see
     out.pop("collectionCode", None)
     out.pop("approvalCode", None)
+    out.pop("reviewFlags", None)
+    out.pop("denialComment", None)
+    out.pop("deniedBy", None)
+    out.pop("deniedAt", None)
+    enrollee = out.get("enrollee") or {}
+    out["enrollee"] = {
+        "fullName": enrollee.get("fullName", ""),
+        "address": enrollee.get("address"),
+    }
     # Serialise datetimes
     for field in ("biddingEndsAt", "createdAt"):
         if field in out and hasattr(out[field], "isoformat"):

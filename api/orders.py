@@ -8,6 +8,7 @@ from fastapi import APIRouter, Cookie, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from core.database import get_db
+from core.review_flags import compute_review_flags
 from core.klaire_client import (
     notify_order_accepted,
     notify_order_created,
@@ -19,6 +20,8 @@ from core.sse import sse_manager
 
 _PHARMACY_SERVICE_KEY = os.getenv("PHARMACY_SERVICE_KEY", "")
 from models.schemas import (
+    AssignOrderRequest,
+    RejectOrderRequest,
     BidOut,
     ClearlineApproveRequest,
     CreateOrderRequest,
@@ -129,6 +132,7 @@ def _order_summary(order: dict, bid_count: int = 0) -> OrderSummary:
         except Exception:
             pass
     return OrderSummary(
+        reviewFlags=order.get("reviewFlags"),
         id=str(order["_id"]),
         intakeId=order.get("intakeId", ""),
         enrollee=enrollee,
@@ -143,6 +147,8 @@ def _order_summary(order: dict, bid_count: int = 0) -> OrderSummary:
         winnerTotalPrice=order.get("winnerTotalPrice"),
         fulfillmentType=order.get("fulfillmentType"),
         deliveryFee=order.get("deliveryFee"),
+        assignmentType=order.get("assignmentType"),
+        denialComment=order.get("denialComment"),
     )
 
 
@@ -185,6 +191,7 @@ def _order_detail(
     provider_raw = order.get("provider")
     provider = Provider(**provider_raw) if provider_raw else None
     return OrderDetail(
+        reviewFlags=order.get("reviewFlags") if is_staff else None,
         id=str(order["_id"]),
         intakeId=order["intakeId"],
         enrollee=enrollee,
@@ -200,6 +207,10 @@ def _order_detail(
         createdAt=order["createdAt"],
         createdBy=order["createdBy"],
         bids=bids,
+        assignmentType=order.get("assignmentType") if is_staff else None,
+        denialComment=order.get("denialComment") if is_staff else None,
+        deniedBy=order.get("deniedBy") if is_staff else None,
+        deniedAt=order.get("deniedAt") if is_staff else None,
     )
 
 
@@ -329,6 +340,7 @@ async def create_order(
 
     now = datetime.now(timezone.utc)
     doc = {
+        "reviewFlags": await compute_review_flags(body.enrollee.model_dump(), now),
         "intakeId": generate_intake_id(),
         "enrollee": body.enrollee.model_dump(),
         "provider": body.provider.model_dump(),
@@ -400,13 +412,15 @@ async def approve_order(
         raise HTTPException(status_code=400, detail="Order is not pending review")
 
     now = datetime.now(timezone.utc)
-    await db.orders.update_one(
-        {"_id": ObjectId(order_id)},
+    result = await db.orders.update_one(
+        {"_id": ObjectId(order_id), "status": "pending_review"},
         {"$set": {
             "status": "bidding",
             "biddingEndsAt": now + timedelta(minutes=BIDDING_WINDOW_MINUTES),
         }},
     )
+    if not result.matched_count:
+        raise HTTPException(status_code=400, detail="Order is not pending review")
 
     # Notify enrollee via Klaire that their order has been received
     enrollee = order.get("enrollee", {})
@@ -430,10 +444,11 @@ async def approve_order(
 @router.post("/orders/{order_id}/reject")
 async def reject_order(
     order_id: str,
+    body: RejectOrderRequest,
     staff_session: str | None = Cookie(default=None),
     x_service_key: str = Header(default=""),
 ):
-    _require_staff(staff_session, x_service_key)
+    staff_user = _require_staff(staff_session, x_service_key)
     db = get_db()
 
     order = await db.orders.find_one({"_id": ObjectId(order_id)})
@@ -443,10 +458,14 @@ async def reject_order(
     if order.get("status") != "pending_review":
         raise HTTPException(status_code=400, detail="Order is not pending review")
 
-    await db.orders.update_one(
-        {"_id": ObjectId(order_id)},
-        {"$set": {"status": "rejected"}},
+    result = await db.orders.update_one(
+        {"_id": ObjectId(order_id), "status": "pending_review"},
+        {"$set": {"status": "rejected", "denialComment": body.comment,
+                  "deniedBy": {"userId": staff_user["userId"], "name": staff_user.get("name")},
+                  "deniedAt": datetime.now(timezone.utc)}},
     )
+    if not result.matched_count:
+        raise HTTPException(status_code=400, detail="Order is not pending review")
     return {"success": True}
 
 
@@ -474,17 +493,31 @@ async def update_order(
     patch: dict = {}
     if body.enrollee is not None:
         patch["enrollee"] = body.enrollee.model_dump()
+        previous_id = (order.get("enrollee") or {}).get("enrolleeId")
+        if body.enrollee.enrolleeId != previous_id:
+            patch["reviewFlags"] = await compute_review_flags(
+                body.enrollee.model_dump(), datetime.now(timezone.utc)
+            )
     if body.provider is not None:
         patch["provider"] = body.provider.model_dump()
     if body.medications is not None:
         patch["medications"] = [m.model_dump() for m in body.medications]
 
     # Editing a rejected order moves it back to pending_review for re-review
+    unset = None
     if order.get("status") == "rejected":
         patch["status"] = "pending_review"
+        unset = {"denialComment": "", "deniedBy": "", "deniedAt": ""}
 
     if patch:
-        await db.orders.update_one({"_id": ObjectId(order_id)}, {"$set": patch})
+        update = {"$set": patch}
+        if unset:
+            update["$unset"] = unset
+        result = await db.orders.update_one(
+            {"_id": ObjectId(order_id), "status": order["status"]}, update
+        )
+        if not result.matched_count:
+            raise HTTPException(status_code=400, detail="Order status changed while editing")
 
     return {"success": True}
 
@@ -789,16 +822,17 @@ async def fulfill_order(
     phone = enrollee.get("phone")
 
     if fulfillment_type == "delivered":
-        current_total = order.get("winnerTotalPrice") or 0
-        new_total = current_total + (delivery_fee or 0)
+        delivered_set = {
+            "status": "awaiting_confirmation",
+            "fulfillmentType": "delivered",
+            "deliveryFee": delivery_fee,
+        }
+        current_total = order.get("winnerTotalPrice")
+        if current_total is not None:
+            delivered_set["winnerTotalPrice"] = current_total + (delivery_fee or 0)
         await db.orders.update_one(
             {"_id": ObjectId(order_id)},
-            {"$set": {
-                "status": "awaiting_confirmation",
-                "fulfillmentType": "delivered",
-                "deliveryFee": delivery_fee,
-                "winnerTotalPrice": new_total,
-            }},
+            {"$set": delivered_set},
         )
         await sse_manager.broadcast(order_id, "order_fulfilled", {})
         if phone:
@@ -944,3 +978,55 @@ async def push_unsubscribe(
 async def pharmacy_vapid_public_key():
     from core.push_manager import VAPID_PUBLIC_KEY
     return {"vapid_public_key": VAPID_PUBLIC_KEY}
+
+
+@router.get("/aggregators")
+async def list_aggregators(
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    rows = await get_db().aggregator_users.find(
+        {}, {"companyName": 1, "contactName": 1, "email": 1}
+    ).to_list(None)
+    return [{"id": str(row["_id"]), "companyName": row.get("companyName"),
+             "contactName": row.get("contactName"), "email": row.get("email")} for row in rows]
+
+
+@router.post("/orders/{order_id}/assign")
+async def assign_order(
+    order_id: str,
+    body: AssignOrderRequest,
+    staff_session: str | None = Cookie(default=None),
+    x_service_key: str = Header(default=""),
+):
+    _require_staff(staff_session, x_service_key)
+    db = get_db()
+    if not ObjectId.is_valid(order_id):
+        raise HTTPException(status_code=404, detail="Order not found")
+    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.get("status") != "pending_review":
+        raise HTTPException(status_code=400, detail="Order is not pending review")
+    if not ObjectId.is_valid(body.aggregatorId):
+        raise HTTPException(status_code=404, detail="Aggregator not found")
+    aggregator = await db.aggregator_users.find_one({"_id": ObjectId(body.aggregatorId)})
+    if not aggregator:
+        raise HTTPException(status_code=404, detail="Aggregator not found")
+    result = await db.orders.update_one(
+        {"_id": order["_id"], "status": "pending_review"},
+        {"$set": {"status": "awaiting_fulfillment", "assignmentType": "direct",
+                  "winnerId": str(aggregator["_id"]),
+                  "winnerName": aggregator.get("companyName") or "Aggregator",
+                  "biddingEndsAt": None}},
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=400, detail="Order is not pending review")
+    enrollee = order.get("enrollee", {})
+    if enrollee.get("phone"):
+        asyncio.create_task(notify_order_created(
+            phone=enrollee["phone"], enrollee_id=enrollee.get("enrolleeId", ""),
+            enrollee_name=enrollee.get("fullName", ""), medications=_med_names(order), order_id=order_id,
+        ))
+    return {"success": True}
