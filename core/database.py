@@ -12,7 +12,7 @@ async def connect_db():
     global _client, _db
     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     db_name = os.getenv("DB_NAME", "pharmacy_dispatch")
-    _client = AsyncIOMotorClient(mongo_uri)
+    _client = AsyncIOMotorClient(mongo_uri, tz_aware=True)
     _db = _client[db_name]
 
     # Ensure indexes

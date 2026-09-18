@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Literal
 
-from pydantic import BaseModel, EmailStr, StringConstraints
+from pydantic import BaseModel, EmailStr, StringConstraints, Field
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +31,10 @@ class AggregatorLoginRequest(BaseModel):
 class UserResponse(BaseModel):
     name: str
     email: str
+
+
+class StaffIdentityResponse(UserResponse):
+    userId: str
 
 
 class AuthResponse(BaseModel):
@@ -97,11 +101,53 @@ class RejectOrderRequest(BaseModel):
     comment: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
+Price = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+Reason = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+
+
+class AcceptOrderRequest(BaseModel):
+    expectedVersion: Optional[int] = Field(default=None, ge=0)
+
+
+class VersionRequest(BaseModel):
+    expectedVersion: int = Field(ge=0)
+
+
+class ReasonRequest(VersionRequest):
+    reason: Reason
+
+
+class DirectQuoteRequest(VersionRequest):
+    totalPrice: Price
+
+
+class DirectApproveRequest(VersionRequest):
+    adjusted_price: Optional[Price] = None
+    reason: Optional[Reason] = None
+
+
+class PriceAdjustmentRequest(ReasonRequest):
+    totalPrice: Price
+
+
 class AssignOrderRequest(BaseModel):
     aggregatorId: str
+    expectedVersion: Optional[int] = Field(default=None, ge=0)
 
 
-class OrderSummary(BaseModel):
+class LifecycleFields(BaseModel):
+    version: int = 0
+    assignmentVersion: int = 0
+    directQuote: Optional[dict] = None
+    priceApprovedAt: Optional[datetime] = None
+    fulfilledAt: Optional[datetime] = None
+    acceptedAt: Optional[datetime] = None
+    cancelledAt: Optional[datetime] = None
+    recalledAt: Optional[datetime] = None
+    paGeneration: dict = Field(default_factory=lambda: {"available": False, "status": "not_configured"})
+
+
+class OrderSummary(LifecycleFields):
     reviewFlags: Optional[dict] = None
     id: str
     intakeId: str
@@ -121,7 +167,9 @@ class OrderSummary(BaseModel):
     denialComment: Optional[str] = None
 
 
-class OrderDetail(BaseModel):
+class OrderDetail(LifecycleFields):
+    history: list[dict] = Field(default_factory=list)
+    completedAt: Optional[datetime] = None
     reviewFlags: Optional[dict] = None
     id: str
     intakeId: str
@@ -160,13 +208,14 @@ class CreateOrderResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PlaceBidRequest(BaseModel):
-    unitPrice: float
-    totalPrice: float
+    unitPrice: Price
+    totalPrice: Price
 
 
 class FulfillOrderRequest(BaseModel):
-    fulfillmentType: str  # 'delivered' or 'picked_up'
-    deliveryFee: Optional[float] = None
+    fulfillmentType: Literal["delivered", "picked_up"]
+    deliveryFee: Optional[Annotated[float, Field(ge=0, allow_inf_nan=False)]] = None
+    expectedVersion: Optional[int] = Field(default=None, ge=0)
 
 
 class UpdateOrderRequest(BaseModel):
@@ -194,4 +243,4 @@ class KlaireCallbackRequest(BaseModel):
 
 
 class ClearlineApproveRequest(BaseModel):
-    adjusted_price: Optional[float] = None
+    adjusted_price: Optional[Price] = None

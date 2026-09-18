@@ -12,13 +12,40 @@ import pytest
 from api import orders
 
 
+def matches(row, query):
+    return all(row.get(k) in v["$in"] if isinstance(v, dict) and "$in" in v else row.get(k) == v
+               for k, v in query.items())
+
+
+class Cursor:
+    def __init__(self, rows):
+        self.rows = deepcopy(rows)
+
+    def sort(self, key, direction):
+        self.rows.sort(key=lambda r: r.get(key, 0), reverse=direction < 0)
+        return self
+
+    def limit(self, limit):
+        self.rows = self.rows[:limit]
+        return self
+
+    async def to_list(self, limit):
+        return deepcopy(self.rows if limit is None else self.rows[:limit])
+
+    def __aiter__(self):
+        async def items():
+            for row in self.rows:
+                yield deepcopy(row)
+        return items()
+
+
 class Collection:
     def __init__(self, rows=()):
         self.rows = list(rows)
         self.writes = 0
 
     async def find_one(self, query):
-        return next((deepcopy(r) for r in self.rows if all(r.get(k) == v for k, v in query.items())), None)
+        return next((deepcopy(r) for r in self.rows if matches(r, query)), None)
 
     async def insert_one(self, doc):
         self.writes += 1
@@ -27,18 +54,22 @@ class Collection:
         self.rows.append(doc)
         return SimpleNamespace(inserted_id=doc["_id"])
 
-    async def update_one(self, query, update):
+    async def update_one(self, query, update, upsert=False):
         for row in self.rows:
-            if all(row.get(k) == v for k, v in query.items()):
+            if matches(row, query):
                 self.writes += 1
-                row.update(update.get("$set", {}))
+                row.update(deepcopy(update.get("$set", {})))
+                for key, value in update.get("$push", {}).items():
+                    row.setdefault(key, []).extend(deepcopy(value["$each"]))
                 for key in update.get("$unset", {}):
                     row.pop(key, None)
                 return SimpleNamespace(matched_count=1)
+        if upsert:
+            await self.insert_one({**query, **update.get("$set", {})})
         return SimpleNamespace(matched_count=0)
 
-    def find(self, *args):
-        return self
+    def find(self, query=None, *args):
+        return Cursor([r for r in self.rows if matches(r, query or {})])
 
     async def to_list(self, limit):
         return deepcopy(self.rows)
@@ -51,10 +82,13 @@ def api(monkeypatch):
     aggregator = {"_id": ObjectId(), "companyName": "Pharmacy", "contactName": "Contact", "email": "test@example.com", "password_hash": "hidden"}
     db = SimpleNamespace(orders=Collection([doc]), aggregator_users=Collection([aggregator]), bids=Collection())
     monkeypatch.setattr(orders, "get_db", lambda: db)
-    monkeypatch.setattr(orders, "decode_session", lambda token: {"userId": "staff", "name": "Reviewer"} if token == "valid" else None)
+    monkeypatch.setattr(orders, "decode_session", lambda token, role=None: {"userId": "staff", "name": "Reviewer"} if token == "valid" else None)
     notify = AsyncMock()
     monkeypatch.setattr(orders, "notify_order_created", notify)
     monkeypatch.setattr(orders, "notify_order_fulfilled", AsyncMock())
+    monkeypatch.setattr(orders, "notify_order_accepted", AsyncMock())
+    monkeypatch.setattr(orders, "notify_order_picked_up", AsyncMock())
+    monkeypatch.setattr(orders.sse_manager, "broadcast", AsyncMock())
     app = FastAPI()
     app.include_router(orders.router, prefix="/api")
     with TestClient(app) as client:
@@ -89,7 +123,7 @@ def test_approve(api):
 def test_assign(api):
     client, db, doc, aggregator, notify = api
     assert client.post(f'/api/orders/{doc["_id"]}/assign', json={"aggregatorId": str(aggregator["_id"])}).status_code == 200
-    assert doc["status"] == "awaiting_fulfillment"
+    assert doc["status"] == "direct_quote_requested"
     assert doc["winnerId"] == str(aggregator["_id"])
     assert doc["winnerName"] == "Pharmacy"
     assert doc["assignmentType"] == "direct"
@@ -147,9 +181,10 @@ def test_direct_deliver_does_not_invent_price(api, monkeypatch):
     client, db, doc, aggregator, _ = api
     assert client.post(f'/api/orders/{doc["_id"]}/assign', json={"aggregatorId": str(aggregator["_id"])}).status_code == 200
     doc["status"] = "accepted"
+    doc.pop("assignmentVersion")  # legacy accepted direct order, no price
     monkeypatch.setattr(orders, "_require_aggregator", lambda *_a, **_k: {"userId": str(aggregator["_id"]), "name": "Pharmacy"})
     monkeypatch.setattr(orders.sse_manager, "broadcast", AsyncMock())
-    resp = client.post(f'/api/orders/{doc["_id"]}/fulfill', json={"fulfillmentType": "delivered", "deliveryFee": 500})
+    resp = client.post(f'/api/orders/{doc["_id"]}/fulfill', json={"fulfillmentType": "delivered", "deliveryFee": 500, "expectedVersion": doc["version"]})
     assert resp.status_code == 200
     assert doc.get("winnerTotalPrice") is None
     assert doc["deliveryFee"] == 500

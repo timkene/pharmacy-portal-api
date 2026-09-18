@@ -1,3 +1,4 @@
+import hmac
 import asyncio
 import os
 from datetime import datetime, timezone
@@ -9,6 +10,10 @@ from fastapi.responses import StreamingResponse
 
 from core.database import get_db
 from core.review_flags import compute_review_flags
+from core.order_lifecycle import (
+    POST_FULFILMENT, DIRECT_ACTIVE, load_order, check_version, require_direct,
+    lifecycle_fields, transition,
+)
 from core.klaire_client import (
     notify_order_accepted,
     notify_order_created,
@@ -21,6 +26,7 @@ from core.sse import sse_manager
 _PHARMACY_SERVICE_KEY = os.getenv("PHARMACY_SERVICE_KEY", "")
 from models.schemas import (
     AssignOrderRequest,
+    AcceptOrderRequest, ReasonRequest, DirectQuoteRequest, DirectApproveRequest, PriceAdjustmentRequest,
     RejectOrderRequest,
     BidOut,
     ClearlineApproveRequest,
@@ -49,11 +55,11 @@ BIDDING_WINDOW_MINUTES = 60
 # ---------------------------------------------------------------------------
 
 def _require_staff(staff_session: str | None, x_service_key: str = "") -> dict:
-    if _PHARMACY_SERVICE_KEY and x_service_key == _PHARMACY_SERVICE_KEY:
+    if _PHARMACY_SERVICE_KEY and hmac.compare_digest(x_service_key.encode(), _PHARMACY_SERVICE_KEY.encode()):
         return {"userId": "service", "name": "Clearline Analytics"}
     if not staff_session:
         raise HTTPException(status_code=401, detail="Staff authentication required")
-    user = decode_session(staff_session)
+    user = decode_session(staff_session, "staff")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid staff session")
     return user
@@ -62,7 +68,7 @@ def _require_staff(staff_session: str | None, x_service_key: str = "") -> dict:
 def _require_aggregator(aggregator_session: str | None) -> dict:
     if not aggregator_session:
         raise HTTPException(status_code=401, detail="Aggregator authentication required")
-    user = decode_session(aggregator_session)
+    user = decode_session(aggregator_session, "aggregator")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid aggregator session")
     return user
@@ -74,14 +80,14 @@ def _require_any(
     x_service_key: str = "",
 ) -> tuple[dict, str]:
     """Return (user_dict, role) where role is 'staff' or 'aggregator'."""
-    if _PHARMACY_SERVICE_KEY and x_service_key == _PHARMACY_SERVICE_KEY:
+    if _PHARMACY_SERVICE_KEY and hmac.compare_digest(x_service_key.encode(), _PHARMACY_SERVICE_KEY.encode()):
         return {"userId": "service", "name": "Clearline Analytics"}, "staff"
     if staff_session:
-        user = decode_session(staff_session)
+        user = decode_session(staff_session, "staff")
         if user:
             return user, "staff"
     if aggregator_session:
-        user = decode_session(aggregator_session)
+        user = decode_session(aggregator_session, "aggregator")
         if user:
             return user, "aggregator"
     raise HTTPException(status_code=401, detail="Authentication required")
@@ -132,6 +138,7 @@ def _order_summary(order: dict, bid_count: int = 0) -> OrderSummary:
         except Exception:
             pass
     return OrderSummary(
+        **lifecycle_fields(order),
         reviewFlags=order.get("reviewFlags"),
         id=str(order["_id"]),
         intakeId=order.get("intakeId", ""),
@@ -191,6 +198,9 @@ def _order_detail(
     provider_raw = order.get("provider")
     provider = Provider(**provider_raw) if provider_raw else None
     return OrderDetail(
+        **lifecycle_fields(order),
+        history=order.get("history", []) if is_staff else [],
+        completedAt=order.get("completedAt"),
         reviewFlags=order.get("reviewFlags") if is_staff else None,
         id=str(order["_id"]),
         intakeId=order["intakeId"],
@@ -207,7 +217,7 @@ def _order_detail(
         createdAt=order["createdAt"],
         createdBy=order["createdBy"],
         bids=bids,
-        assignmentType=order.get("assignmentType") if is_staff else None,
+        assignmentType=order.get("assignmentType"),
         denialComment=order.get("denialComment") if is_staff else None,
         deniedBy=order.get("deniedBy") if is_staff else None,
         deniedAt=order.get("deniedAt") if is_staff else None,
@@ -228,9 +238,7 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
     close the bidding session, pick a winner, and broadcast SSE events.
     Returns the (potentially updated) order document.
     """
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order["status"] != "bidding":
         return order
@@ -249,8 +257,10 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
 
     if not winning_bids:
         update = {"$set": {"status": "clearline_price_review"}}
-        await db.orders.update_one({"_id": ObjectId(order_id)}, update)
-        order = await db.orders.find_one({"_id": ObjectId(order_id)})
+        result = await db.orders.update_one({"_id": ObjectId(order_id), "status": "bidding"}, update)
+        if not result.matched_count:
+            return await load_order(db, order_id)
+        order = await load_order(db, order_id)
         await sse_manager.broadcast(
             order_id,
             "session_closed",
@@ -267,8 +277,10 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
             "winnerTotalPrice": winner["totalPrice"],
         }
     }
-    await db.orders.update_one({"_id": ObjectId(order_id)}, update)
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
+    result = await db.orders.update_one({"_id": ObjectId(order_id), "status": "bidding"}, update)
+    if not result.matched_count:
+        return await load_order(db, order_id)
+    order = await load_order(db, order_id)
 
     # Broadcast bidding-closed so the live table stops; winner info is withheld
     # from aggregators until Clearline approves via /clearline-approve.
@@ -382,11 +394,8 @@ async def delete_order(
 ):
     _require_staff(staff_session, x_service_key)
     db = get_db()
-    result = await db.orders.delete_one({"_id": ObjectId(order_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Order not found")
-    await db.bids.delete_many({"orderId": order_id})
-    return {"success": True}
+    await load_order(db, order_id)
+    raise HTTPException(405, "Orders cannot be deleted; use cancel or recall with a reason")
 
 
 # ---------------------------------------------------------------------------
@@ -404,9 +413,7 @@ async def approve_order(
 
     from datetime import timedelta
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "pending_review":
         raise HTTPException(status_code=400, detail="Order is not pending review")
@@ -451,9 +458,7 @@ async def reject_order(
     staff_user = _require_staff(staff_session, x_service_key)
     db = get_db()
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "pending_review":
         raise HTTPException(status_code=400, detail="Order is not pending review")
@@ -483,9 +488,7 @@ async def update_order(
     _require_staff(staff_session, x_service_key)
     db = get_db()
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") not in ("pending_review", "rejected"):
         raise HTTPException(status_code=400, detail="Only pending or rejected orders can be edited")
@@ -537,9 +540,7 @@ async def close_bidding_early(
 
     from datetime import timedelta
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "bidding":
         raise HTTPException(status_code=400, detail="Order is not in bidding status")
@@ -547,7 +548,7 @@ async def close_bidding_early(
     # Move biddingEndsAt into the past so check_and_close_bidding triggers immediately
     now = datetime.now(timezone.utc)
     await db.orders.update_one(
-        {"_id": ObjectId(order_id)},
+        {"_id": ObjectId(order_id), "status": "bidding"},
         {"$set": {"biddingEndsAt": now - timedelta(seconds=1)}},
     )
     await check_and_close_bidding(order_id, db)
@@ -567,12 +568,10 @@ async def clearline_approve(
     staff_session: str | None = Cookie(default=None),
     x_service_key: str = Header(default=""),
 ):
-    _require_staff(staff_session, x_service_key)
+    staff = _require_staff(staff_session, x_service_key)
     db = get_db()
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "clearline_price_review":
         raise HTTPException(status_code=400, detail="Order is not in Clearline price review")
@@ -581,7 +580,7 @@ async def clearline_approve(
     if body and body.adjusted_price is not None:
         patch["winnerTotalPrice"] = body.adjusted_price
 
-    await db.orders.update_one({"_id": ObjectId(order_id)}, {"$set": patch})
+    await transition(db, order, patch, "price_approved", staff, "staff")
     order = await db.orders.find_one({"_id": ObjectId(order_id)})
 
     await sse_manager.broadcast(
@@ -611,6 +610,8 @@ async def get_order(
     db = get_db()
 
     order = await check_and_close_bidding(order_id, db)
+    if role == "aggregator" and order.get("assignmentType") == "direct":
+        require_direct(order, user)
 
     bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
     raw_bids = await bids_cursor.to_list(None)
@@ -645,13 +646,19 @@ async def order_stream(
     aggregator_session: str | None = Cookie(default=None),
     x_service_key: str = Header(default=""),
 ):
-    _require_any(staff_session, aggregator_session, x_service_key)
+    user, role = _require_any(staff_session, aggregator_session, x_service_key)
     db = get_db()
+
+    initial_order = await load_order(db, order_id)
+    if role == "aggregator" and initial_order.get("assignmentType") == "direct":
+        require_direct(initial_order, user)
 
     async def event_generator() -> AsyncGenerator[str, None]:
         order = await check_and_close_bidding(order_id, db)
         bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
         raw_bids = await bids_cursor.to_list(None)
+        if role == "aggregator":
+            raw_bids = [b for b in raw_bids if b["aggregatorId"] == user["userId"]]
         import json
         initial_bids = [
             {
@@ -672,9 +679,18 @@ async def order_stream(
             while True:
                 try:
                     msg = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_INTERVAL)
-                    yield msg
                 except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
+                    msg = ": keepalive\n\n"
+                if role == "aggregator":
+                    current = await load_order(db, order_id)
+                    if current.get("assignmentType") == "direct" and current.get("winnerId") != user["userId"]:
+                        yield 'event: access_revoked\ndata: {"refresh": true}\n\n'
+                        return
+                    # Shared channel contains competitor bids and staff pricing.
+                    # Tell aggregators to refetch their authorized detail instead.
+                    yield 'event: order_changed\ndata: {"refresh": true}\n\n'
+                else:
+                    yield msg
         finally:
             sse_manager.unsubscribe(order_id, queue)
 
@@ -755,14 +771,13 @@ async def place_bid(
 @router.post("/orders/{order_id}/accept")
 async def accept_order(
     order_id: str,
+    body: AcceptOrderRequest | None = None,
     aggregator_session: str | None = Cookie(default=None),
 ):
     agg_user = _require_aggregator(aggregator_session)
     db = get_db()
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "awaiting_fulfillment":
         raise HTTPException(status_code=400, detail="Order is not awaiting fulfillment")
@@ -770,10 +785,12 @@ async def accept_order(
     if order.get("winnerId") != agg_user["userId"]:
         raise HTTPException(status_code=403, detail="Only the winning aggregator can accept this order")
 
-    await db.orders.update_one(
-        {"_id": ObjectId(order_id)},
-        {"$set": {"status": "accepted"}},
-    )
+    if order.get("assignmentType") == "direct":
+        check_version(order, body.expectedVersion if body else None)
+        if not order.get("priceApprovedAt") or order.get("winnerTotalPrice") is None:
+            raise HTTPException(400, "Direct price must be approved before acceptance; recall legacy assignments to requote")
+    result = await transition(db, order, {"status": "accepted", "acceptedAt": datetime.now(timezone.utc)},
+                             "aggregator_accepted", agg_user, "aggregator")
     await sse_manager.broadcast(order_id, "order_accepted", {"aggregatorName": agg_user["name"]})
 
     # Notify enrollee via Klaire
@@ -788,7 +805,7 @@ async def accept_order(
             order_id=order_id,
         ))
 
-    return {"success": True}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -804,15 +821,18 @@ async def fulfill_order(
     agg_user = _require_aggregator(aggregator_session)
     db = get_db()
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "accepted":
         raise HTTPException(status_code=400, detail="Order must be in accepted status to mark as fulfilled")
 
     if order.get("winnerId") != agg_user["userId"]:
         raise HTTPException(status_code=403, detail="Only the winning aggregator can fulfill this order")
+
+    if order.get("assignmentType") == "direct":
+        check_version(order, body.expectedVersion if body else None)
+        if order.get("assignmentVersion", 0) and not order.get("priceApprovedAt"):
+            raise HTTPException(400, "Direct price must be approved before fulfilment")
 
     fulfillment_type = (body.fulfillmentType if body else None) or "picked_up"
     delivery_fee = body.deliveryFee if body else None
@@ -826,14 +846,12 @@ async def fulfill_order(
             "status": "awaiting_confirmation",
             "fulfillmentType": "delivered",
             "deliveryFee": delivery_fee,
+            "fulfilledAt": now,
         }
         current_total = order.get("winnerTotalPrice")
         if current_total is not None:
             delivered_set["winnerTotalPrice"] = current_total + (delivery_fee or 0)
-        await db.orders.update_one(
-            {"_id": ObjectId(order_id)},
-            {"$set": delivered_set},
-        )
+        result = await transition(db, order, delivered_set, "fulfilled", agg_user, "aggregator")
         await sse_manager.broadcast(order_id, "order_fulfilled", {})
         if phone:
             asyncio.create_task(notify_order_fulfilled(
@@ -846,14 +864,9 @@ async def fulfill_order(
             ))
     else:
         # picked_up — closes immediately; Klaire notifies enrollee as a receipt
-        await db.orders.update_one(
-            {"_id": ObjectId(order_id)},
-            {"$set": {
-                "status": "completed",
-                "fulfillmentType": "picked_up",
-                "completedAt": now,
-            }},
-        )
+        result = await transition(db, order, {
+            "status": "completed", "fulfillmentType": "picked_up", "completedAt": now, "fulfilledAt": now,
+        }, "fulfilled", agg_user, "aggregator")
         await sse_manager.broadcast(order_id, "order_completed", {"received": True})
         if phone:
             asyncio.create_task(notify_order_picked_up(
@@ -865,7 +878,7 @@ async def fulfill_order(
                 order_id=order_id,
             ))
 
-    return {"success": True}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -880,9 +893,7 @@ async def klaire_callback(
 ):
     db = get_db()
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "awaiting_confirmation":
         # Idempotent — if already resolved, just return ok
@@ -896,10 +907,9 @@ async def klaire_callback(
         new_status = "not_received"
         event = "order_not_received"
 
-    await db.orders.update_one(
-        {"_id": ObjectId(order_id)},
-        {"$set": {"status": new_status, "completedAt": now}},
-    )
+    await transition(db, order, {"status": new_status, "completedAt": now},
+                     "receipt_confirmed" if body.received else "receipt_disputed",
+                     {"userId": "klaire", "name": "Klaire"}, "system")
     await sse_manager.broadcast(order_id, event, {"received": body.received})
 
     return {"success": True}
@@ -913,14 +923,12 @@ async def klaire_callback(
 async def staff_confirm_receipt(
     order_id: str,
     staff_session: str | None = Cookie(default=None),
-    x_service_key: str | None = Header(default=None),
+    x_service_key: str = Header(default=""),
 ):
-    _require_staff(staff_session, x_service_key)
+    staff = _require_staff(staff_session, x_service_key)
     db = get_db()
 
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
+    order = await load_order(db, order_id)
 
     if order.get("status") != "awaiting_confirmation":
         raise HTTPException(
@@ -929,10 +937,8 @@ async def staff_confirm_receipt(
         )
 
     now = datetime.now(timezone.utc)
-    await db.orders.update_one(
-        {"_id": ObjectId(order_id)},
-        {"$set": {"status": "completed", "completedAt": now}},
-    )
+    await transition(db, order, {"status": "completed", "completedAt": now},
+                     "receipt_confirmed", staff, "staff")
     await sse_manager.broadcast(order_id, "order_completed", {"received": True})
 
     return {"success": True}
@@ -1000,33 +1006,151 @@ async def assign_order(
     staff_session: str | None = Cookie(default=None),
     x_service_key: str = Header(default=""),
 ):
-    _require_staff(staff_session, x_service_key)
+    staff = _require_staff(staff_session)
     db = get_db()
     if not ObjectId.is_valid(order_id):
         raise HTTPException(status_code=404, detail="Order not found")
-    order = await db.orders.find_one({"_id": ObjectId(order_id)})
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-    if order.get("status") != "pending_review":
-        raise HTTPException(status_code=400, detail="Order is not pending review")
+    order = await load_order(db, order_id)
+    if order.get("status") not in {"pending_review", "direct_reassignment"}:
+        raise HTTPException(400, "Order must be pending review or awaiting direct reassignment")
+    if order["status"] == "direct_reassignment" or body.expectedVersion is not None:
+        check_version(order, body.expectedVersion)
     if not ObjectId.is_valid(body.aggregatorId):
         raise HTTPException(status_code=404, detail="Aggregator not found")
     aggregator = await db.aggregator_users.find_one({"_id": ObjectId(body.aggregatorId)})
     if not aggregator:
         raise HTTPException(status_code=404, detail="Aggregator not found")
-    result = await db.orders.update_one(
-        {"_id": order["_id"], "status": "pending_review"},
-        {"$set": {"status": "awaiting_fulfillment", "assignmentType": "direct",
-                  "winnerId": str(aggregator["_id"]),
-                  "winnerName": aggregator.get("companyName") or "Aggregator",
-                  "biddingEndsAt": None}},
-    )
-    if not result.matched_count:
-        raise HTTPException(status_code=400, detail="Order is not pending review")
+    result = await transition(db, order, {
+        "status": "direct_quote_requested", "assignmentType": "direct",
+        "winnerId": str(aggregator["_id"]), "winnerName": aggregator.get("companyName") or "Aggregator",
+        "winnerTotalPrice": None, "biddingEndsAt": None, "directQuote": None,
+        "priceApprovedAt": None, "acceptedAt": None,
+        "denialComment": None, "deniedBy": None, "deniedAt": None,
+        "assignmentVersion": order.get("assignmentVersion", 0) + 1,
+    }, "direct_reassigned" if order["status"] == "direct_reassignment" else "direct_assigned", staff, "staff")
     enrollee = order.get("enrollee", {})
     if enrollee.get("phone"):
         asyncio.create_task(notify_order_created(
             phone=enrollee["phone"], enrollee_id=enrollee.get("enrolleeId", ""),
             enrollee_name=enrollee.get("fullName", ""), medications=_med_names(order), order_id=order_id,
         ))
-    return {"success": True}
+    return result
+
+
+@router.post("/orders/{order_id}/direct-quote")
+async def submit_direct_quote(
+    order_id: str, body: DirectQuoteRequest,
+    aggregator_session: str | None = Cookie(default=None),
+):
+    actor = _require_aggregator(aggregator_session)
+    db = get_db()
+    order = await load_order(db, order_id)
+    require_direct(order, actor)
+    check_version(order, body.expectedVersion)
+    if order["status"] != "direct_quote_requested":
+        raise HTTPException(400, "Order is not waiting for a direct quote")
+    quote = {"totalPrice": body.totalPrice, "submittedAt": datetime.now(timezone.utc),
+             "aggregatorId": actor["userId"], "assignmentVersion": order.get("assignmentVersion", 0)}
+    return await transition(db, order, {"status": "direct_price_review", "directQuote": quote},
+                            "direct_quote_submitted", actor, "aggregator")
+
+
+@router.post("/orders/{order_id}/direct-approve")
+async def approve_direct_quote(
+    order_id: str, body: DirectApproveRequest,
+    staff_session: str | None = Cookie(default=None), x_service_key: str = Header(default=""),
+):
+    actor = _require_staff(staff_session)
+    db = get_db()
+    order = await load_order(db, order_id)
+    require_direct(order)
+    check_version(order, body.expectedVersion)
+    if order["status"] != "direct_price_review" or not order.get("directQuote"):
+        raise HTTPException(400, "Order is not in direct price review")
+    quoted_price = order["directQuote"]["totalPrice"]
+    price = body.adjusted_price if body.adjusted_price is not None else quoted_price
+    adjusted = price != quoted_price
+    if adjusted and not body.reason:
+        raise HTTPException(422, "A reason is required when adjusting the quote")
+    return await transition(db, order, {
+        "status": "awaiting_fulfillment", "winnerTotalPrice": price,
+        "priceApprovedAt": datetime.now(timezone.utc),
+    }, "direct_quote_approved", actor, "staff", body.reason,
+        extra_events=("price_adjusted",) if adjusted else ())
+
+
+@router.post("/orders/{order_id}/direct-deny")
+async def deny_direct_quote(
+    order_id: str, body: ReasonRequest,
+    staff_session: str | None = Cookie(default=None), x_service_key: str = Header(default=""),
+):
+    actor = _require_staff(staff_session)
+    db = get_db()
+    order = await load_order(db, order_id)
+    require_direct(order)
+    check_version(order, body.expectedVersion)
+    if order["status"] != "direct_price_review":
+        raise HTTPException(400, "Order is not in direct price review")
+    return await transition(db, order, {
+        "status": "direct_reassignment", "winnerId": None, "winnerName": None,
+        "winnerTotalPrice": None, "priceApprovedAt": None,
+        "denialComment": body.reason,
+        "deniedBy": {"userId": actor["userId"], "name": actor.get("name")},
+        "deniedAt": datetime.now(timezone.utc),
+    }, "direct_quote_denied", actor, "staff", body.reason)
+
+
+@router.post("/orders/{order_id}/recall")
+async def recall_order(
+    order_id: str, body: ReasonRequest,
+    staff_session: str | None = Cookie(default=None), x_service_key: str = Header(default=""),
+):
+    actor = _require_staff(staff_session)
+    db = get_db()
+    order = await load_order(db, order_id)
+    if order["status"] in {"cancelled", "post_fulfilment_recalled"}:
+        raise HTTPException(409, f"Order is already terminal ({order['status']}); action unavailable")
+    check_version(order, body.expectedVersion)
+    if order["status"] in POST_FULFILMENT:
+        patch = {"status": "post_fulfilment_recalled", "recalledAt": datetime.now(timezone.utc)}
+        event = "post_fulfilment_recalled"
+    else:
+        require_direct(order)
+        if order["status"] not in DIRECT_ACTIVE:
+            raise HTTPException(400, "Order cannot be recalled in its current state")
+        patch = {"status": "direct_reassignment", "winnerId": None, "winnerName": None,
+                 "winnerTotalPrice": None, "priceApprovedAt": None}
+        event = "direct_recalled"
+    return await transition(db, order, patch, event, actor, "staff", body.reason)
+
+
+@router.post("/orders/{order_id}/adjust-price")
+async def adjust_final_price(
+    order_id: str, body: PriceAdjustmentRequest,
+    staff_session: str | None = Cookie(default=None), x_service_key: str = Header(default=""),
+):
+    actor = _require_staff(staff_session)
+    db = get_db()
+    order = await load_order(db, order_id)
+    check_version(order, body.expectedVersion)
+    if order["status"] not in POST_FULFILMENT:
+        raise HTTPException(400, "Final price can only be adjusted after fulfilment")
+    return await transition(db, order, {"winnerTotalPrice": body.totalPrice},
+                            "price_adjusted", actor, "staff", body.reason)
+
+
+@router.post("/orders/{order_id}/cancel")
+async def cancel_order(
+    order_id: str, body: ReasonRequest,
+    staff_session: str | None = Cookie(default=None), x_service_key: str = Header(default=""),
+):
+    actor = _require_staff(staff_session)
+    db = get_db()
+    order = await load_order(db, order_id)
+    if order["status"] in {"cancelled", "post_fulfilment_recalled"}:
+        raise HTTPException(409, f"Order is already terminal ({order['status']}); action unavailable")
+    check_version(order, body.expectedVersion)
+    if order["status"] not in POST_FULFILMENT:
+        raise HTTPException(400, "Administrative cancellation is available after fulfilment")
+    return await transition(db, order, {"status": "cancelled", "cancelledAt": datetime.now(timezone.utc)},
+                            "cancelled", actor, "staff", body.reason)

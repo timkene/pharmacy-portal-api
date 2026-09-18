@@ -4,7 +4,10 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
+      - key: SESSION_SECRET
+        sync: false
       - key: MONGO_URI
         sync: false
       - key: DB_NAME

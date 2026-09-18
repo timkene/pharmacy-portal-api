@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Cookie, HTTPException, Response
 
 from core.database import get_db
 from core.security import (
@@ -13,10 +13,24 @@ from models.schemas import (
     AggregatorSignupRequest,
     AuthResponse,
     StaffLoginRequest,
+    StaffIdentityResponse,
     UserResponse,
 )
 
 router = APIRouter(tags=["auth"])
+
+
+@router.get("/staff/me", response_model=StaffIdentityResponse)
+async def staff_me(response: Response, staff_session: str | None = Cookie(default=None)):
+    if not staff_session:
+        raise HTTPException(status_code=401, detail="Staff authentication required")
+    user = decode_session(staff_session, "staff")
+    if not user or user.get("role") != "staff" or any(
+        not isinstance(user.get(field), str) for field in ("userId", "name", "email")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid staff session")
+    response.headers["Cache-Control"] = "no-store"
+    return StaffIdentityResponse(userId=user["userId"], name=user["name"], email=user["email"])
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +45,7 @@ async def staff_login(body: StaffLoginRequest, response: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     payload = {
+        "role": "staff",
         "userId": str(user["_id"]),
         "name": user["name"],
         "email": user["email"],
@@ -69,6 +84,7 @@ async def aggregator_signup(body: AggregatorSignupRequest, response: Response):
     user_id = str(result.inserted_id)
 
     payload = {
+        "role": "aggregator",
         "userId": user_id,
         "name": body.companyName,
         "email": body.email,
@@ -90,6 +106,7 @@ async def aggregator_login(body: AggregatorLoginRequest, response: Response):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     payload = {
+        "role": "aggregator",
         "userId": str(user["_id"]),
         "name": user["companyName"],
         "email": user["email"],
