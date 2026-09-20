@@ -9,7 +9,7 @@ router = APIRouter(tags=["aggregator"])
 def _require_aggregator(aggregator_session: str | None) -> dict:
     if not aggregator_session:
         raise HTTPException(status_code=401, detail="Aggregator authentication required")
-    user = decode_session(aggregator_session)
+    user = decode_session(aggregator_session, "aggregator")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid aggregator session")
     return user
@@ -19,7 +19,11 @@ def _serialize_order(order: dict) -> dict:
     """Convert a MongoDB order document to a JSON-serialisable dict."""
     out = {k: v for k, v in order.items()}
     out["id"] = str(out.pop("_id"))
+    out.setdefault("version", 0)
+    out.setdefault("assignmentVersion", 0)
     # Remove fields aggregators should not see
+    out.pop("history", None)
+    out.pop("createdBy", None)
     out.pop("collectionCode", None)
     out.pop("approvalCode", None)
     out.pop("reviewFlags", None)
@@ -50,14 +54,14 @@ async def aggregator_orders_list(
     open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
     open_orders = [_serialize_order(o) async for o in open_cursor]
 
-    active_statuses = ["awaiting_fulfillment", "accepted", "awaiting_confirmation"]
+    active_statuses = ["direct_quote_requested", "direct_price_review", "awaiting_fulfillment", "accepted", "awaiting_confirmation"]
     active_cursor = db.orders.find(
         {"winnerId": agg_id, "status": {"$in": active_statuses}}
     ).sort("createdAt", -1)
     active_orders = [_serialize_order(o) async for o in active_cursor]
 
     fulfilled_cursor = db.orders.find(
-        {"winnerId": agg_id, "status": "completed"}
+        {"winnerId": agg_id, "status": {"$in": ["completed", "fulfilled", "not_received", "cancelled", "post_fulfilment_recalled"]}}
     ).sort("createdAt", -1)
     fulfilled_orders = [_serialize_order(o) async for o in fulfilled_cursor]
 
@@ -86,7 +90,7 @@ async def aggregator_dashboard(
     open_orders = [_serialize_order(o) async for o in open_cursor]
 
     # Orders this aggregator won that are still active
-    won_statuses = ["awaiting_fulfillment", "collection_verified"]
+    won_statuses = ["direct_quote_requested", "direct_price_review", "awaiting_fulfillment", "accepted", "awaiting_confirmation", "collection_verified"]
     won_cursor = db.orders.find(
         {"winnerId": agg_id, "status": {"$in": won_statuses}}
     ).sort("createdAt", -1)
@@ -94,7 +98,7 @@ async def aggregator_dashboard(
 
     # Orders this aggregator won that are fully fulfilled
     completed_cursor = db.orders.find(
-        {"winnerId": agg_id, "status": "fulfilled"}
+        {"winnerId": agg_id, "status": {"$in": ["completed", "fulfilled", "not_received", "cancelled", "post_fulfilment_recalled"]}}
     ).sort("createdAt", -1)
     completed_orders = [_serialize_order(o) async for o in completed_cursor]
 

@@ -1,14 +1,16 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from api import aggregator, auth, orders, search
 from core.database import close_db, connect_db
+from core.security import validate_session_secret
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_session_secret()
     await connect_db()
     yield
     await close_db()
@@ -35,4 +37,8 @@ app.include_router(search.router, prefix="/api")
 
 @app.get("/health")
 async def health():
+    try:
+        validate_session_secret()
+    except RuntimeError:
+        raise HTTPException(503, "Authentication configuration is invalid") from None
     return {"status": "ok"}

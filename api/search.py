@@ -11,7 +11,7 @@ NHIA_BASE = "https://clearline-nhia-api.onrender.com"
 def _require_staff(staff_session: str | None) -> dict:
     if not staff_session:
         raise HTTPException(status_code=401, detail="Staff authentication required")
-    user = decode_session(staff_session)
+    user = decode_session(staff_session, "staff")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid session")
     return user
