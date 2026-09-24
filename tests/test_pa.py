@@ -372,7 +372,7 @@ def test_price_recall_and_cancel_blocked_after_pa_starts(pa_flow, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pa_client_contract_and_fail_closed(monkeypatch):
+async def test_pa_client_contract_and_fail_closed(monkeypatch, caplog):
     monkeypatch.delenv("MEDICLOUD_LEGACY_URL", raising=False)
     with pytest.raises(RuntimeError): pa_client._base()
     monkeypatch.setenv("MEDICLOUD_LEGACY_URL", "https://fake.example/intermediary")
@@ -398,8 +398,26 @@ async def test_pa_client_contract_and_fail_closed(monkeypatch):
     assert payload["Quantity"] == 3 and payload["AmountRequested"] == 4200
     assert payload["AdditionalServices"] == []
     assert await pa_client.issue_pa(payload) == "PA-123"
-    assert requests[0].headers["username"] == "fake-user"
+    assert requests[0].headers["authorization"] == "Basic ZmFrZS11c2VyOmZha2UtcGFzcw=="
+    assert "username" not in requests[0].headers
+    assert "password" not in requests[0].headers
     assert requests[1].url.path.endswith("/IssuePa")
+    assert requests[1].headers["authorization"] == requests[0].headers["authorization"]
+    assert "fake-user" not in caplog.text and "fake-pass" not in caplog.text
+
+
+def test_member_lookup_failure_stops_before_issue_pa(pa_flow, monkeypatch):
+    _, _, doc, _, _ = pa_flow
+    issue = AsyncMock()
+    monkeypatch.setattr(pa, "get_member_info", AsyncMock(side_effect=httpx.HTTPStatusError(
+        "member lookup rejected", request=httpx.Request("GET", "https://fake.example/member"),
+        response=httpx.Response(401))))
+    monkeypatch.setattr(pa, "issue_pa", issue)
+    response = generate(pa_flow)
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Member data for PA could not be verified; no PA was submitted"
+    issue.assert_not_awaited()
+    assert "paGeneration" not in doc
 
 
 @pytest.mark.asyncio

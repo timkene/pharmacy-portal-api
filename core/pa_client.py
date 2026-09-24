@@ -22,10 +22,9 @@ def _credentials():
 
 
 async def get_member_info(enrollee_id: str):
-    username, password = _credentials()
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.get(f"{_base()}/member", params={"hmonumber": enrollee_id},
-                                    headers={"username": username, "password": password})
+                                    auth=_credentials())
         response.raise_for_status()
         data = response.json()
     member = data[0] if isinstance(data, list) and data else data

@@ -18,7 +18,12 @@ IssuePa POST. Delivery causes a separate PRE11 POST at the stored delivery fee. 
 uses the working CDR field names and leaves `AdditionalServices` empty.
 All three PA date fields use the calendar date in `Africa/Lagos` when PA generation runs.
 `MEDICLOUD_LEGACY_URL` and credentials must be explicitly configured; there is no production
-URL default. The delivery PRE11 diagnosis requires an explicit `PA_DELIVERY_DIAGNOSIS_CODE`.
+URL default. `GET /member` uses HTTP Basic authentication. This follows the latest explicit
+committed repository contract in commit `063f1f8804522b4e566fc063dae15d754d2b59b4`.
+Repository evidence contains no staging or sandbox integration endpoint, so no live verification
+was performed. Controlled integration verification remains desirable before broad rollout; the
+implementation follows the strongest committed contract evidence currently available. The delivery
+PRE11 diagnosis requires an explicit `PA_DELIVERY_DIAGNOSIS_CODE`.
 No authoritative delivery diagnosis convention was found in repository contracts.
 
 PA lines move from `pending` to `submitting` to `generated`, `failed_retryable`, or
