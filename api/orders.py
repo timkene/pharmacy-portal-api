@@ -21,6 +21,7 @@ from core.klaire_client import (
     notify_order_picked_up,
 )
 from core.security import decode_session, generate_intake_id
+from core.pricing import medication_docs, price_lines, subtotal, totals, money
 from core.sse import sse_manager
 
 _PHARMACY_SERVICE_KEY = os.getenv("PHARMACY_SERVICE_KEY", "")
@@ -105,6 +106,7 @@ def _bid_to_out(bid: dict, *, is_cheapest: bool = False) -> BidOut:
         aggregatorName=bid["aggregatorName"],
         unitPrice=bid["unitPrice"],
         totalPrice=bid["totalPrice"],
+        procedurePrices=bid.get("procedurePrices"),
         isCheapest=is_cheapest,
         submittedAt=bid["submittedAt"],
     )
@@ -197,9 +199,21 @@ def _order_detail(
 
     provider_raw = order.get("provider")
     provider = Provider(**provider_raw) if provider_raw else None
+    lifecycle = lifecycle_fields(order)
+    if is_staff:
+        from api.pa import public_pa_state
+        lifecycle["paGeneration"] = public_pa_state(order)
+    if not is_staff:
+        lifecycle["paGeneration"] = {"available": False, "status": "hidden"}
+        if not is_winner:
+            for field in ("quotedProcedurePrices", "approvedProcedurePrices", "finalProcedurePrices",
+                          "medicationSubtotal", "overallTotal"):
+                lifecycle[field] = None
     return OrderDetail(
-        **lifecycle_fields(order),
-        history=order.get("history", []) if is_staff else [],
+        **lifecycle,
+        history=[{key: value for key, value in event.items() if key not in {"providerId", "token", "leaseUntil"}}
+                 if str(event.get("eventType", "")).startswith("pa_") else event
+                 for event in order.get("history", [])] if is_staff else [],
         completedAt=order.get("completedAt"),
         reviewFlags=order.get("reviewFlags") if is_staff else None,
         id=str(order["_id"]),
@@ -275,6 +289,7 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
             "winnerId": winner["aggregatorId"],
             "winnerName": winner["aggregatorName"],
             "winnerTotalPrice": winner["totalPrice"],
+            "quotedProcedurePrices": winner.get("procedurePrices"),
         }
     }
     result = await db.orders.update_one({"_id": ObjectId(order_id), "status": "bidding"}, update)
@@ -348,6 +363,10 @@ async def create_order(
     x_service_key: str = Header(default=""),
 ):
     staff_user = _require_staff(staff_session, x_service_key)
+    if len(body.medications) > 10 or any(not (med.procedureCode or "").strip() or med.procedureCode == "PRE11"
+                                  or not (med.diagnosisCode or "").strip() or med.quantity <= 0
+                                  for med in body.medications):
+        raise HTTPException(422, "Each medication needs a non-PRE11 procedure code, diagnosis code, and positive quantity")
     db = get_db()
 
     now = datetime.now(timezone.utc)
@@ -356,7 +375,7 @@ async def create_order(
         "intakeId": generate_intake_id(),
         "enrollee": body.enrollee.model_dump(),
         "provider": body.provider.model_dump(),
-        "medications": [m.model_dump() for m in body.medications],
+        "medications": medication_docs([m.model_dump(exclude={"lineId"}) for m in body.medications]),
         "status": "pending_review",
         "winnerId": None,
         "winnerName": None,
@@ -504,7 +523,11 @@ async def update_order(
     if body.provider is not None:
         patch["provider"] = body.provider.model_dump()
     if body.medications is not None:
-        patch["medications"] = [m.model_dump() for m in body.medications]
+        if len(body.medications) > 10 or any(not (med.procedureCode or "").strip() or med.procedureCode == "PRE11"
+                                       or not (med.diagnosisCode or "").strip() or med.quantity <= 0
+                                       for med in body.medications):
+            raise HTTPException(422, "Each medication needs a non-PRE11 procedure code, diagnosis code, and positive quantity")
+        patch["medications"] = medication_docs([m.model_dump(exclude={"lineId"}) for m in body.medications])
 
     # Editing a rejected order moves it back to pending_review for re-review
     unset = None
@@ -576,11 +599,39 @@ async def clearline_approve(
     if order.get("status") != "clearline_price_review":
         raise HTTPException(status_code=400, detail="Order is not in Clearline price review")
 
+    if order.get("medications") and all(med.get("lineId") for med in order["medications"]) and order.get("winnerId"):
+        if not ObjectId.is_valid(order["winnerId"]):
+            raise HTTPException(422, "Winning aggregator ID is invalid")
+        selected_aggregator = await db.aggregator_users.find_one({"_id": ObjectId(order["winnerId"])})
+        if not str((selected_aggregator or {}).get("providerId") or "").strip():
+            raise HTTPException(422, "Winning aggregator providerId must be configured before price approval")
+
     patch: dict = {"status": "awaiting_fulfillment"}
+    quoted_lines = order.get("quotedProcedurePrices")
+    if order.get("quotedProcedurePrices"):
+        if body and body.adjusted_price is not None:
+            raise HTTPException(422, "Adjust procedure prices individually")
+        lines = price_lines(order["medications"], body.procedurePrices) if body and body.procedurePrices is not None else order["quotedProcedurePrices"]
+        if lines != order["quotedProcedurePrices"] and not body.reason:
+            raise HTTPException(422, "A reason is required when adjusting procedure prices")
+        patch.update({"approvedProcedurePrices": lines, "finalProcedurePrices": lines, **totals(lines)})
+    elif body and body.procedurePrices is not None:
+        raise HTTPException(422, "Legacy order has no procedure-level quote")
+    elif order.get("winnerId"):
+        winning_bid = await db.bids.find_one({"orderId": order_id, "aggregatorId": order["winnerId"]})
+        if winning_bid and winning_bid.get("procedurePrices"):
+            quoted_lines = winning_bid["procedurePrices"]
+            lines = price_lines(order["medications"], body.procedurePrices) if body and body.procedurePrices is not None else winning_bid["procedurePrices"]
+            if lines != quoted_lines and not (body and body.reason and body.reason.strip()):
+                raise HTTPException(422, "A reason is required when adjusting procedure prices")
+            patch.update({"quotedProcedurePrices": winning_bid["procedurePrices"],
+                          "approvedProcedurePrices": lines, "finalProcedurePrices": lines, **totals(lines)})
     if body and body.adjusted_price is not None:
         patch["winnerTotalPrice"] = body.adjusted_price
 
-    await transition(db, order, patch, "price_approved", staff, "staff")
+    await transition(db, order, patch, "price_approved", staff, "staff",
+                     body.reason if body else None,
+                     extra_events=("price_adjusted",) if quoted_lines and patch.get("approvedProcedurePrices") != quoted_lines else ())
     order = await db.orders.find_one({"_id": ObjectId(order_id)})
 
     await sse_manager.broadcast(
@@ -729,12 +780,19 @@ async def place_bid(
     if now >= bidding_ends:
         raise HTTPException(status_code=400, detail="Bidding session has expired")
 
+    lines = price_lines(order["medications"], body.procedurePrices) if body.procedurePrices is not None else None
+    if any(m.get("lineId") for m in order["medications"]) and lines is None:
+        raise HTTPException(422, "Procedure prices are required for this order")
+    if lines is None and body.totalPrice is None:
+        raise HTTPException(422, "Procedure prices or legacy total price required")
+    bid_total = subtotal(lines) if lines is not None else body.totalPrice
     bid_doc = {
         "orderId": order_id,
         "aggregatorId": agg_user["userId"],
         "aggregatorName": agg_user["name"],
-        "unitPrice": body.unitPrice,
-        "totalPrice": body.totalPrice,
+        "unitPrice": body.unitPrice or bid_total,
+        "totalPrice": bid_total,
+        "procedurePrices": lines,
         "submittedAt": now,
     }
     await db.bids.update_one(
@@ -833,6 +891,10 @@ async def fulfill_order(
         check_version(order, body.expectedVersion if body else None)
         if order.get("assignmentVersion", 0) and not order.get("priceApprovedAt"):
             raise HTTPException(400, "Direct price must be approved before fulfilment")
+    if order.get("finalProcedurePrices"):
+        aggregator = await db.aggregator_users.find_one({"_id": ObjectId(agg_user["userId"])})
+        if not (aggregator or {}).get("providerId"):
+            raise HTTPException(422, "Aggregator providerId must be configured before fulfilment")
 
     fulfillment_type = (body.fulfillmentType if body else None) or "picked_up"
     delivery_fee = body.deliveryFee if body else None
@@ -842,15 +904,21 @@ async def fulfill_order(
     phone = enrollee.get("phone")
 
     if fulfillment_type == "delivered":
+        if delivery_fee is None:
+            raise HTTPException(422, "Delivery fee is required")
+        delivery_fee = float(money(delivery_fee, "Delivery fee"))
         delivered_set = {
             "status": "awaiting_confirmation",
             "fulfillmentType": "delivered",
             "deliveryFee": delivery_fee,
             "fulfilledAt": now,
         }
-        current_total = order.get("winnerTotalPrice")
-        if current_total is not None:
-            delivered_set["winnerTotalPrice"] = current_total + (delivery_fee or 0)
+        if order.get("finalProcedurePrices"):
+            delivered_set.update(totals(order["finalProcedurePrices"], delivery_fee))
+        else:
+            current_total = order.get("winnerTotalPrice")
+            if current_total is not None:
+                delivered_set["winnerTotalPrice"] = current_total + delivery_fee
         result = await transition(db, order, delivered_set, "fulfilled", agg_user, "aggregator")
         await sse_manager.broadcast(order_id, "order_fulfilled", {})
         if phone:
@@ -863,9 +931,12 @@ async def fulfill_order(
                 order_id=order_id,
             ))
     else:
+        if delivery_fee is not None:
+            raise HTTPException(422, "Pickup must not have a delivery fee")
         # picked_up — closes immediately; Klaire notifies enrollee as a receipt
         result = await transition(db, order, {
             "status": "completed", "fulfillmentType": "picked_up", "completedAt": now, "fulfilledAt": now,
+            **(totals(order["finalProcedurePrices"]) if order.get("finalProcedurePrices") else {}),
         }, "fulfilled", agg_user, "aggregator")
         await sse_manager.broadcast(order_id, "order_completed", {"received": True})
         if phone:
@@ -1020,10 +1091,14 @@ async def assign_order(
     aggregator = await db.aggregator_users.find_one({"_id": ObjectId(body.aggregatorId)})
     if not aggregator:
         raise HTTPException(status_code=404, detail="Aggregator not found")
+    if order.get("medications") and all(med.get("lineId") for med in order["medications"]) and not str(aggregator.get("providerId") or "").strip():
+        raise HTTPException(422, "Aggregator providerId must be configured before assignment")
     result = await transition(db, order, {
         "status": "direct_quote_requested", "assignmentType": "direct",
         "winnerId": str(aggregator["_id"]), "winnerName": aggregator.get("companyName") or "Aggregator",
         "winnerTotalPrice": None, "biddingEndsAt": None, "directQuote": None,
+        "quotedProcedurePrices": None, "approvedProcedurePrices": None, "finalProcedurePrices": None,
+        "medicationSubtotal": None, "overallTotal": None, "deliveryFee": None,
         "priceApprovedAt": None, "acceptedAt": None,
         "denialComment": None, "deniedBy": None, "deniedAt": None,
         "assignmentVersion": order.get("assignmentVersion", 0) + 1,
@@ -1051,7 +1126,15 @@ async def submit_direct_quote(
         raise HTTPException(400, "Order is not waiting for a direct quote")
     quote = {"totalPrice": body.totalPrice, "submittedAt": datetime.now(timezone.utc),
              "aggregatorId": actor["userId"], "assignmentVersion": order.get("assignmentVersion", 0)}
-    return await transition(db, order, {"status": "direct_price_review", "directQuote": quote},
+    lines = price_lines(order["medications"], body.procedurePrices) if body.procedurePrices is not None else None
+    if any(m.get("lineId") for m in order["medications"]) and lines is None:
+        raise HTTPException(422, "Procedure prices are required for this order")
+    if lines is None and body.totalPrice is None:
+        raise HTTPException(422, "Procedure prices are required")
+    quote["totalPrice"] = subtotal(lines) if lines is not None else body.totalPrice
+    quote["procedurePrices"] = lines
+    return await transition(db, order, {"status": "direct_price_review", "directQuote": quote,
+                                         "quotedProcedurePrices": lines},
                             "direct_quote_submitted", actor, "aggregator")
 
 
@@ -1068,6 +1151,23 @@ async def approve_direct_quote(
     if order["status"] != "direct_price_review" or not order.get("directQuote"):
         raise HTTPException(400, "Order is not in direct price review")
     quoted_price = order["directQuote"]["totalPrice"]
+    quoted_lines = order["directQuote"].get("procedurePrices")
+    if quoted_lines:
+        if body.adjusted_price is not None:
+            raise HTTPException(422, "Adjust procedure prices individually")
+        lines = price_lines(order["medications"], body.procedurePrices) if body.procedurePrices is not None else quoted_lines
+        price = subtotal(lines)
+        adjusted = lines != quoted_lines
+        if adjusted and not body.reason:
+            raise HTTPException(422, "A reason is required when adjusting procedure prices")
+        return await transition(db, order, {
+            "status": "awaiting_fulfillment", "quotedProcedurePrices": quoted_lines,
+            "approvedProcedurePrices": lines, "finalProcedurePrices": lines,
+            **totals(lines), "priceApprovedAt": datetime.now(timezone.utc),
+        }, "direct_quote_approved", actor, "staff", body.reason,
+            extra_events=("price_adjusted",) if adjusted else ())
+    if body.procedurePrices is not None:
+        raise HTTPException(422, "Legacy order has no procedure-level quote")
     price = body.adjusted_price if body.adjusted_price is not None else quoted_price
     adjusted = price != quoted_price
     if adjusted and not body.reason:
@@ -1110,6 +1210,8 @@ async def recall_order(
     order = await load_order(db, order_id)
     if order["status"] in {"cancelled", "post_fulfilment_recalled"}:
         raise HTTPException(409, f"Order is already terminal ({order['status']}); action unavailable")
+    if order.get("paGeneration", {}).get("lines"):
+        raise HTTPException(409, "Order has PA activity; administrative verification is required")
     check_version(order, body.expectedVersion)
     if order["status"] in POST_FULFILMENT:
         patch = {"status": "post_fulfilment_recalled", "recalledAt": datetime.now(timezone.utc)}
@@ -1135,6 +1237,16 @@ async def adjust_final_price(
     check_version(order, body.expectedVersion)
     if order["status"] not in POST_FULFILMENT:
         raise HTTPException(400, "Final price can only be adjusted after fulfilment")
+    if order.get("paGeneration", {}).get("lines"):
+        raise HTTPException(409, "Prices are locked after PA generation starts")
+    if order.get("finalProcedurePrices"):
+        if body.totalPrice is not None or body.procedurePrices is None:
+            raise HTTPException(422, "Provide explicit final procedure prices")
+        lines = price_lines(order["medications"], body.procedurePrices)
+        patch = {"finalProcedurePrices": lines, **totals(lines, order.get("deliveryFee"))}
+        return await transition(db, order, patch, "price_adjusted", actor, "staff", body.reason)
+    if body.procedurePrices is not None or body.totalPrice is None:
+        raise HTTPException(422, "Legacy order requires its existing total-price adjustment")
     return await transition(db, order, {"winnerTotalPrice": body.totalPrice},
                             "price_adjusted", actor, "staff", body.reason)
 
@@ -1149,6 +1261,8 @@ async def cancel_order(
     order = await load_order(db, order_id)
     if order["status"] in {"cancelled", "post_fulfilment_recalled"}:
         raise HTTPException(409, f"Order is already terminal ({order['status']}); action unavailable")
+    if order.get("paGeneration", {}).get("lines"):
+        raise HTTPException(409, "Order has PA activity; administrative verification is required")
     check_version(order, body.expectedVersion)
     if order["status"] not in POST_FULFILMENT:
         raise HTTPException(400, "Administrative cancellation is available after fulfilment")

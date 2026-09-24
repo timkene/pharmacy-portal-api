@@ -69,6 +69,7 @@ class Provider(BaseModel):
 
 
 class Medication(BaseModel):
+    lineId: Optional[str] = None
     procedureCode: Optional[str] = None
     name: str
     dosage: str
@@ -93,6 +94,7 @@ class BidOut(BaseModel):
     aggregatorName: str
     unitPrice: float
     totalPrice: float
+    procedurePrices: Optional[list[dict]] = None
     isCheapest: bool = False
     submittedAt: datetime
 
@@ -118,16 +120,19 @@ class ReasonRequest(VersionRequest):
 
 
 class DirectQuoteRequest(VersionRequest):
-    totalPrice: Price
+    totalPrice: Optional[Price] = None
+    procedurePrices: Optional[list[dict]] = None
 
 
 class DirectApproveRequest(VersionRequest):
     adjusted_price: Optional[Price] = None
+    procedurePrices: Optional[list[dict]] = None
     reason: Optional[Reason] = None
 
 
 class PriceAdjustmentRequest(ReasonRequest):
-    totalPrice: Price
+    totalPrice: Optional[Price] = None
+    procedurePrices: Optional[list[dict]] = None
 
 
 class AssignOrderRequest(BaseModel):
@@ -145,6 +150,11 @@ class LifecycleFields(BaseModel):
     cancelledAt: Optional[datetime] = None
     recalledAt: Optional[datetime] = None
     paGeneration: dict = Field(default_factory=lambda: {"available": False, "status": "not_configured"})
+    quotedProcedurePrices: Optional[list[dict]] = None
+    approvedProcedurePrices: Optional[list[dict]] = None
+    finalProcedurePrices: Optional[list[dict]] = None
+    medicationSubtotal: Optional[float] = None
+    overallTotal: Optional[float] = None
 
 
 class OrderSummary(LifecycleFields):
@@ -208,13 +218,14 @@ class CreateOrderResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PlaceBidRequest(BaseModel):
-    unitPrice: Price
-    totalPrice: Price
+    unitPrice: Optional[Price] = None
+    totalPrice: Optional[Price] = None
+    procedurePrices: Optional[list[dict]] = None
 
 
 class FulfillOrderRequest(BaseModel):
     fulfillmentType: Literal["delivered", "picked_up"]
-    deliveryFee: Optional[Annotated[float, Field(ge=0, allow_inf_nan=False)]] = None
+    deliveryFee: Optional[Price] = None
     expectedVersion: Optional[int] = Field(default=None, ge=0)
 
 
@@ -244,3 +255,5 @@ class KlaireCallbackRequest(BaseModel):
 
 class ClearlineApproveRequest(BaseModel):
     adjusted_price: Optional[Price] = None
+    procedurePrices: Optional[list[dict]] = None
+    reason: Optional[Reason] = None

@@ -27,6 +27,7 @@ def _serialize_order(order: dict) -> dict:
     out.pop("collectionCode", None)
     out.pop("approvalCode", None)
     out.pop("reviewFlags", None)
+    out.pop("paGeneration", None)
     out.pop("denialComment", None)
     out.pop("deniedBy", None)
     out.pop("deniedAt", None)
