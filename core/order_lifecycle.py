@@ -36,6 +36,9 @@ def lifecycle_fields(order):
         "version": 0, "assignmentVersion": 0, "directQuote": None,
         "priceApprovedAt": None, "fulfilledAt": None, "acceptedAt": None,
         "cancelledAt": None, "recalledAt": None,
+        "paGeneration": {"available": False, "status": "not_configured"},
+        "quotedProcedurePrices": None, "approvedProcedurePrices": None,
+        "finalProcedurePrices": None, "medicationSubtotal": None, "overallTotal": None,
     }.items()}
 
 

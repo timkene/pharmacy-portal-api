@@ -47,7 +47,8 @@ def flow(api, monkeypatch):
             assert self.post("accept", role="aggregator").status_code == 200
             if stage == "accepted": return
             kind = "delivered" if stage == "awaiting_confirmation" else "picked_up"
-            assert self.post("fulfill", {"fulfillmentType": kind, "deliveryFee": 50}, "aggregator").status_code == 200
+            payload = {"fulfillmentType": kind, **({"deliveryFee": 50} if kind == "delivered" else {})}
+            assert self.post("fulfill", payload, "aggregator").status_code == 200
 
     f = Flow()
     f.client, f.db, f.doc, f.agg, f.other = client, db, doc, agg, other
@@ -74,6 +75,65 @@ def test_direct_complete_and_audit(flow):
     detail = f.client.get(f'/api/orders/{f.doc["_id"]}').json()
     assert len(detail["history"]) == 5
     assert detail["paGeneration"] == {"available": False, "status": "not_configured"}
+
+
+def test_procedure_quote_approval_delivery_and_final_adjustment(flow):
+    f = flow
+    f.agg["providerId"] = "4304"
+    f.doc["medications"] = [
+        {"lineId": "a", "procedureCode": "DRG-A", "diagnosisCode": "I10", "name": "A", "quantity": 1},
+        {"lineId": "b", "procedureCode": "DRG-B", "diagnosisCode": "I10", "name": "B", "quantity": 1},
+    ]
+    quoted = [{"medicationLineId": "a", "procedureCode": "DRG-A", "amount": 3000},
+              {"medicationLineId": "b", "procedureCode": "DRG-B", "amount": 4000}]
+    approved = [{**quoted[0], "amount": 2800}, quoted[1]]
+    assert f.post("assign", {"aggregatorId": str(f.agg["_id"])}).status_code == 200
+    assert f.post("direct-quote", {"totalPrice": 1}, "aggregator").status_code == 422
+    assert f.post("direct-quote", {"procedurePrices": quoted, "totalPrice": 1}, "aggregator").status_code == 200
+    assert f.doc["directQuote"]["totalPrice"] == 7000  # Browser total is ignored.
+    assert f.post("direct-approve", {"procedurePrices": approved}).status_code == 422
+    assert f.post("direct-approve", {"procedurePrices": approved, "reason": "Agreed discount"}).status_code == 200
+    assert f.doc["medicationSubtotal"] == 6800
+    assert f.post("accept", role="aggregator").status_code == 200
+    assert f.post("fulfill", {"fulfillmentType": "delivered", "deliveryFee": 250}, "aggregator").status_code == 200
+    assert f.doc["deliveryFee"] == 250 and f.doc["overallTotal"] == 7050
+    final = [{**approved[0], "amount": 2700}, approved[1]]
+    assert f.post("adjust-price", {"procedurePrices": final, "reason": "Final correction"}).status_code == 200
+    assert f.doc["medicationSubtotal"] == 6700 and f.doc["deliveryFee"] == 250 and f.doc["overallTotal"] == 6950
+    assert f.doc["directQuote"]["procedurePrices"] == quoted
+    assert f.doc["approvedProcedurePrices"] == approved
+    assert f.doc["finalProcedurePrices"] == final
+
+
+def test_competitive_procedure_bid_remains_supported(flow):
+    f = flow
+    f.agg["providerId"] = "4304"
+    f.doc["medications"] = [{"lineId": "a", "procedureCode": "DRG-A", "diagnosisCode": "I10", "name": "A", "quantity": 1}]
+    lines = [{"medicationLineId": "a", "procedureCode": "DRG-A", "amount": 3000}]
+    assert f.post("approve").status_code == 200
+    assert f.post("bids", {"unitPrice": 1, "totalPrice": 1}, "aggregator").status_code == 422
+    assert f.post("bids", {"procedurePrices": lines, "totalPrice": 1}, "aggregator").status_code == 200
+    assert f.db.bids.rows[0]["totalPrice"] == 3000
+    assert f.post("close-bidding").status_code == 200
+    assert f.doc["quotedProcedurePrices"] == lines
+    assert f.post("clearline-approve").status_code == 200
+    assert f.doc["finalProcedurePrices"] == lines and f.doc["medicationSubtotal"] == 3000
+
+
+def test_competitive_adjusted_winning_bid_keeps_quote_and_audits_reason(flow):
+    f = flow
+    f.agg["providerId"] = "4304"
+    f.doc["medications"] = [{"lineId": "a", "procedureCode": "DRG-A", "diagnosisCode": "I10", "name": "A", "quantity": 2}]
+    quoted = [{"medicationLineId": "a", "procedureCode": "DRG-A", "amount": 3000}]
+    approved = [{"medicationLineId": "a", "procedureCode": "DRG-A", "amount": 2800}]
+    assert f.post("approve").status_code == 200
+    assert f.post("bids", {"procedurePrices": quoted}, "aggregator").status_code == 200
+    assert f.post("close-bidding").status_code == 200
+    assert f.post("clearline-approve", {"procedurePrices": approved}).status_code == 422
+    assert f.post("clearline-approve", {"procedurePrices": approved, "reason": "Negotiated line discount"}).status_code == 200
+    assert f.doc["quotedProcedurePrices"] == quoted
+    assert f.doc["approvedProcedurePrices"] == f.doc["finalProcedurePrices"] == approved
+    assert any(event["eventType"] == "price_adjusted" and event["reason"] == "Negotiated line discount" for event in f.doc["history"])
 
 
 @pytest.mark.parametrize("stage", ["direct_quote_requested", "direct_price_review"])
