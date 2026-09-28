@@ -434,6 +434,91 @@ async def test_pa_client_rejects_missing_member_fields_and_missing_pa_reference(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure,expected", [
+    ("status", "stage=http_status"),
+    ("timeout", "stage=transport"),
+    ("transport", "stage=transport"),
+    ("unexpected", "stage=unexpected"),
+    ("json", "stage=json_decode"),
+    ("empty", "stage=empty_list"),
+    ("type", "stage=unexpected_response_type"),
+    ("group", "group_id_present=False division_id_present=True"),
+    ("division", "group_id_present=True division_id_present=False"),
+])
+async def test_member_lookup_logs_only_safe_failure_classification(monkeypatch, caplog, failure, expected):
+    member_id = "SECRET-MEMBER-ID"
+    username = "SECRET-USERNAME"
+    password = "SECRET-PASSWORD"
+    response_pii = "SECRET-MEMBER-NAME"
+    monkeypatch.setenv("MEDICLOUD_LEGACY_URL", "https://fake.example/intermediary")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_USER", username)
+    monkeypatch.setenv("MEDICLOUD_LEGACY_PASS", password)
+
+    async def handler(request):
+        if failure == "status":
+            return httpx.Response(403, json={"detail": response_pii})
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timeout containing " + member_id, request=request)
+        if failure == "transport":
+            raise httpx.ConnectError("transport containing " + member_id, request=request)
+        if failure == "unexpected":
+            raise RuntimeError("unexpected containing " + member_id)
+        if failure == "json":
+            return httpx.Response(200, content=("not-json-" + response_pii).encode())
+        if failure == "empty":
+            return httpx.Response(200, json=[])
+        if failure == "type":
+            return httpx.Response(200, json=response_pii)
+        if failure == "group":
+            return httpx.Response(200, json={"DivisionID": "SECRET-DIVISION", "Name": response_pii})
+        return httpx.Response(200, json={"GroupId": "SECRET-GROUP", "Name": response_pii})
+
+    original = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(pa_client.httpx, "AsyncClient", lambda **kwargs: original(transport=transport, **kwargs))
+    with caplog.at_level("WARNING", logger="core.pa_client"):
+        with pytest.raises(Exception):
+            await pa_client.get_member_info(member_id)
+
+    assert expected in caplog.text
+    if failure == "status":
+        assert "upstream_status=403" in caplog.text
+    if failure == "timeout":
+        assert "httpx_classification=timeout" in caplog.text
+    if failure == "transport":
+        assert "httpx_classification=transport" in caplog.text
+    for forbidden in (member_id, username, password, response_pii,
+                      "SECRET-GROUP", "SECRET-DIVISION", "hmonumber", "authorization"):
+        assert forbidden not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_member_lookup_configuration_log_is_sanitized(monkeypatch, caplog):
+    monkeypatch.delenv("MEDICLOUD_LEGACY_URL", raising=False)
+    with caplog.at_level("WARNING", logger="core.pa_client"):
+        with pytest.raises(RuntimeError):
+            await pa_client.get_member_info("SECRET-MEMBER-ID")
+    assert "stage=configuration exception_class=RuntimeError" in caplog.text
+    assert "SECRET-MEMBER-ID" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_member_lookup_success_remains_unchanged_and_logs_no_member_data(monkeypatch, caplog):
+    monkeypatch.setenv("MEDICLOUD_LEGACY_URL", "https://fake.example/intermediary")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_USER", "SECRET-USERNAME")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_PASS", "SECRET-PASSWORD")
+    original = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=[{
+        "GroupId": "SECRET-GROUP", "DivisionID": "SECRET-DIVISION",
+        "DependantNumber": 0, "Name": "SECRET-MEMBER-NAME",
+    }]))
+    monkeypatch.setattr(pa_client.httpx, "AsyncClient", lambda **kwargs: original(transport=transport, **kwargs))
+    result = await pa_client.get_member_info("SECRET-MEMBER-ID")
+    assert result == {"group_id": "SECRET-GROUP", "division_id": "SECRET-DIVISION", "dependant_number": "0"}
+    assert not caplog.text
+
+
+@pytest.mark.asyncio
 async def test_concurrent_claim_blocks_second_request(pa_flow, monkeypatch):
     _, _, doc, _, calls = pa_flow
     entered = asyncio.Event()
