@@ -1,9 +1,25 @@
 """One legacy IssuePa request per procedure. Only this server reads PA credentials."""
+import logging
 import os
 import re
 from datetime import date
+from urllib.parse import urlsplit
 
 import httpx
+
+
+logger = logging.getLogger(__name__)
+
+
+def _member_failure(stage, *, base=None, exc=None, **details):
+    safe = {"stage": stage, **details}
+    if base:
+        parsed = urlsplit(base)
+        safe["upstream_host"] = parsed.hostname or "unknown"
+        safe["upstream_path"] = f"{parsed.path.rstrip('/')}/member" or "/member"
+    if exc:
+        safe["exception_class"] = type(exc).__name__
+    logger.warning("PA member lookup failed %s", " ".join(f"{key}={value}" for key, value in safe.items()))
 
 
 def _base():
@@ -22,20 +38,56 @@ def _credentials():
 
 
 async def get_member_info(enrollee_id: str):
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.get(f"{_base()}/member", params={"hmonumber": enrollee_id},
-                                    auth=_credentials())
-        response.raise_for_status()
+    try:
+        base = _base()
+        credentials = _credentials()
+    except RuntimeError as exc:
+        _member_failure("configuration", exc=exc)
+        raise
+    except Exception as exc:
+        _member_failure("unexpected", exc=exc)
+        raise
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(f"{base}/member", params={"hmonumber": enrollee_id},
+                                        auth=credentials)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        _member_failure("http_status", base=base, exc=exc,
+                        upstream_status=exc.response.status_code)
+        raise
+    except httpx.TimeoutException as exc:
+        _member_failure("transport", base=base, exc=exc, httpx_classification="timeout")
+        raise
+    except httpx.TransportError as exc:
+        _member_failure("transport", base=base, exc=exc, httpx_classification="transport")
+        raise
+    except Exception as exc:
+        _member_failure("unexpected", base=base, exc=exc)
+        raise
+    try:
         data = response.json()
+    except ValueError as exc:
+        _member_failure("json_decode", base=base, exc=exc)
+        raise
+    if isinstance(data, list) and not data:
+        _member_failure("empty_list", base=base, json_top_level_type="list")
+        raise ValueError("Member lookup returned invalid data")
     member = data[0] if isinstance(data, list) and data else data
     if not isinstance(member, dict):
+        _member_failure("unexpected_response_type", base=base,
+                        json_top_level_type=type(data).__name__)
         raise ValueError("Member lookup returned invalid data")
+    group_present = bool(member.get("GroupId") or member.get("groupId"))
+    division_present = bool(member.get("DivisionID") or member.get("divisionId"))
     result = {
         "group_id": str(member.get("GroupId") or member.get("groupId") or ""),
         "division_id": str(member.get("DivisionID") or member.get("divisionId") or ""),
         "dependant_number": str(member.get("DependantNumber") or member.get("dependantNumber") or "0"),
     }
     if not result["group_id"] or not result["division_id"]:
+        _member_failure("missing_required_fields", base=base,
+                        group_id_present=group_present, division_id_present=division_present)
         raise ValueError("Member lookup did not return required PA fields")
     return result
 
