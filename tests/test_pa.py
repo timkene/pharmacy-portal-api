@@ -387,7 +387,7 @@ async def test_pa_client_contract_and_fail_closed(monkeypatch, caplog):
     async def handler(request):
         requests.append(request)
         if request.url.path.endswith("/member"):
-            return httpx.Response(200, json=[{"GroupId": "G", "DivisionID": "D", "DependantNumber": 0}])
+            return httpx.Response(200, json={"group_id": "G", "division_id": "D", "dependant_number": 0})
         return httpx.Response(200, json={"PANumber": "PA-123"})
     transport = httpx.MockTransport(handler)
     original = httpx.AsyncClient
@@ -398,11 +398,13 @@ async def test_pa_client_contract_and_fail_closed(monkeypatch, caplog):
     assert payload["Quantity"] == 3 and payload["AmountRequested"] == 4200
     assert payload["AdditionalServices"] == []
     assert await pa_client.issue_pa(payload) == "PA-123"
-    assert requests[0].headers["authorization"] == "Basic ZmFrZS11c2VyOmZha2UtcGFzcw=="
-    assert "username" not in requests[0].headers
-    assert "password" not in requests[0].headers
+    assert "authorization" not in requests[0].headers
+    assert requests[0].headers["username"] == "fake-user"
+    assert requests[0].headers["password"] == "fake-pass"
     assert requests[1].url.path.endswith("/IssuePa")
-    assert requests[1].headers["authorization"] == requests[0].headers["authorization"]
+    assert requests[1].headers["authorization"] == "Basic ZmFrZS11c2VyOmZha2UtcGFzcw=="
+    assert "username" not in requests[1].headers
+    assert "password" not in requests[1].headers
     assert "fake-user" not in caplog.text and "fake-pass" not in caplog.text
 
 
@@ -426,7 +428,7 @@ async def test_pa_client_rejects_missing_member_fields_and_missing_pa_reference(
     monkeypatch.setenv("MEDICLOUD_LEGACY_USER", "fake-user")
     monkeypatch.setenv("MEDICLOUD_LEGACY_PASS", "fake-pass")
     async def handler(request):
-        return httpx.Response(200, json={"GroupId": "G"} if request.method == "GET" else {"AdmissionCode": "0"})
+        return httpx.Response(200, json={"group_id": "G"} if request.method == "GET" else {"AdmissionCode": "0"})
     original = httpx.AsyncClient
     monkeypatch.setattr(pa_client.httpx, "AsyncClient", lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs))
     with pytest.raises(ValueError): await pa_client.get_member_info("M1")
@@ -470,8 +472,8 @@ async def test_member_lookup_logs_only_safe_failure_classification(monkeypatch, 
         if failure == "type":
             return httpx.Response(200, json=response_pii)
         if failure == "group":
-            return httpx.Response(200, json={"DivisionID": "SECRET-DIVISION", "Name": response_pii})
-        return httpx.Response(200, json={"GroupId": "SECRET-GROUP", "Name": response_pii})
+            return httpx.Response(200, json={"division_id": "SECRET-DIVISION", "Name": response_pii})
+        return httpx.Response(200, json={"group_id": "SECRET-GROUP", "Name": response_pii})
 
     original = httpx.AsyncClient
     transport = httpx.MockTransport(handler)
@@ -509,8 +511,8 @@ async def test_member_lookup_success_remains_unchanged_and_logs_no_member_data(m
     monkeypatch.setenv("MEDICLOUD_LEGACY_PASS", "SECRET-PASSWORD")
     original = httpx.AsyncClient
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=[{
-        "GroupId": "SECRET-GROUP", "DivisionID": "SECRET-DIVISION",
-        "DependantNumber": 0, "Name": "SECRET-MEMBER-NAME",
+        "group_id": "SECRET-GROUP", "division_id": "SECRET-DIVISION",
+        "dependant_number": 0, "Name": "SECRET-MEMBER-NAME",
     }]))
     monkeypatch.setattr(pa_client.httpx, "AsyncClient", lambda **kwargs: original(transport=transport, **kwargs))
     result = await pa_client.get_member_info("SECRET-MEMBER-ID")

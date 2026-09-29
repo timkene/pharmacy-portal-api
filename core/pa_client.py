@@ -50,7 +50,7 @@ async def get_member_info(enrollee_id: str):
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.get(f"{base}/member", params={"hmonumber": enrollee_id},
-                                        auth=credentials)
+                                        headers={"username": credentials[0], "password": credentials[1]})
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         _member_failure("http_status", base=base, exc=exc,
@@ -78,12 +78,13 @@ async def get_member_info(enrollee_id: str):
         _member_failure("unexpected_response_type", base=base,
                         json_top_level_type=type(data).__name__)
         raise ValueError("Member lookup returned invalid data")
-    group_present = bool(member.get("GroupId") or member.get("groupId"))
-    division_present = bool(member.get("DivisionID") or member.get("divisionId"))
+    group_present = bool(member.get("GroupId") or member.get("groupId") or member.get("group_id"))
+    division_present = bool(member.get("DivisionID") or member.get("divisionId") or member.get("division_id"))
     result = {
-        "group_id": str(member.get("GroupId") or member.get("groupId") or ""),
-        "division_id": str(member.get("DivisionID") or member.get("divisionId") or ""),
-        "dependant_number": str(member.get("DependantNumber") or member.get("dependantNumber") or "0"),
+        "group_id": str(member.get("GroupId") or member.get("groupId") or member.get("group_id") or ""),
+        "division_id": str(member.get("DivisionID") or member.get("divisionId") or member.get("division_id") or ""),
+        "dependant_number": str(member.get("DependantNumber") or member.get("dependantNumber") or
+                                member.get("dependant_number") or "0"),
     }
     if not result["group_id"] or not result["division_id"]:
         _member_failure("missing_required_fields", base=base,
