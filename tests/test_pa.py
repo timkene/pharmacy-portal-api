@@ -521,6 +521,84 @@ async def test_member_lookup_success_remains_unchanged_and_logs_no_member_data(m
 
 
 @pytest.mark.asyncio
+async def test_member_lookup_normalizes_current_live_aliases_without_logging_data(monkeypatch, caplog):
+    monkeypatch.setenv("MEDICLOUD_LEGACY_URL", "https://fake.example/intermediary")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_USER", "SECRET-USERNAME")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_PASS", "SECRET-PASSWORD")
+    original = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "groupID": "SECRET-LIVE-GROUP",
+        "divisionID": "SECRET-LIVE-DIVISION",
+        "dependentNumber": 7,
+        "Name": "SECRET-MEMBER-NAME",
+    }))
+    monkeypatch.setattr(pa_client.httpx, "AsyncClient",
+                        lambda **kwargs: original(transport=transport, **kwargs))
+
+    result = await pa_client.get_member_info("SECRET-MEMBER-ID")
+
+    assert result == {
+        "group_id": "SECRET-LIVE-GROUP",
+        "division_id": "SECRET-LIVE-DIVISION",
+        "dependant_number": "7",
+    }
+    assert not caplog.text
+
+
+@pytest.mark.asyncio
+async def test_member_lookup_current_live_zero_values_are_present(monkeypatch, caplog):
+    monkeypatch.setenv("MEDICLOUD_LEGACY_URL", "https://fake.example/intermediary")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_USER", "fake-user")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_PASS", "fake-pass")
+    original = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "groupID": 0, "divisionID": 0, "dependentNumber": 0,
+    }))
+    monkeypatch.setattr(pa_client.httpx, "AsyncClient",
+                        lambda **kwargs: original(transport=transport, **kwargs))
+
+    result = await pa_client.get_member_info("M1")
+
+    assert result == {
+        "group_id": "0", "division_id": "0", "dependant_number": "0",
+    }
+    assert "missing_required_fields" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_key", ["GroupId", "groupId", "group_id"])
+@pytest.mark.parametrize("division_key", ["DivisionID", "divisionId", "division_id"])
+@pytest.mark.parametrize("dependant_key", ["DependantNumber", "dependantNumber", "dependant_number"])
+async def test_member_lookup_preserves_historical_aliases(
+    monkeypatch, group_key, division_key, dependant_key
+):
+    monkeypatch.setenv("MEDICLOUD_LEGACY_URL", "https://fake.example/intermediary")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_USER", "fake-user")
+    monkeypatch.setenv("MEDICLOUD_LEGACY_PASS", "fake-pass")
+    original = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+        group_key: "G", division_key: "D", dependant_key: 4,
+    }))
+    monkeypatch.setattr(pa_client.httpx, "AsyncClient",
+                        lambda **kwargs: original(transport=transport, **kwargs))
+
+    assert await pa_client.get_member_info("M1") == {
+        "group_id": "G", "division_id": "D", "dependant_number": "4",
+    }
+
+
+def test_member_alias_precedence_is_explicit_and_current_first():
+    member = {
+        "groupID": "CURRENT-G", "GroupId": "OLD-G",
+        "divisionID": "CURRENT-D", "DivisionID": "OLD-D",
+        "dependentNumber": 2, "DependantNumber": 3,
+    }
+    assert pa_client._first_member_value(member, pa_client._GROUP_ID_ALIASES) == "CURRENT-G"
+    assert pa_client._first_member_value(member, pa_client._DIVISION_ID_ALIASES) == "CURRENT-D"
+    assert pa_client._first_member_value(member, pa_client._DEPENDANT_NUMBER_ALIASES) == 2
+
+
+@pytest.mark.asyncio
 async def test_concurrent_claim_blocks_second_request(pa_flow, monkeypatch):
     _, _, doc, _, calls = pa_flow
     entered = asyncio.Event()

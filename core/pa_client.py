@@ -10,6 +10,21 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+_GROUP_ID_ALIASES = ("groupID", "GroupId", "groupId", "group_id")
+_DIVISION_ID_ALIASES = ("divisionID", "DivisionID", "divisionId", "division_id")
+_DEPENDANT_NUMBER_ALIASES = (
+    "dependentNumber", "DependantNumber", "dependantNumber", "dependant_number",
+)
+
+
+def _first_member_value(member, aliases, default=""):
+    """Return the first non-empty alias in the declared precedence order."""
+    for alias in aliases:
+        value = member.get(alias)
+        if value is not None and value != "":
+            return value
+    return default
+
 
 def _member_failure(stage, *, base=None, exc=None, **details):
     safe = {"stage": stage, **details}
@@ -78,14 +93,16 @@ async def get_member_info(enrollee_id: str):
         _member_failure("unexpected_response_type", base=base,
                         json_top_level_type=type(data).__name__)
         raise ValueError("Member lookup returned invalid data")
-    group_present = bool(member.get("GroupId") or member.get("groupId") or member.get("group_id"))
-    division_present = bool(member.get("DivisionID") or member.get("divisionId") or member.get("division_id"))
+    group_id = _first_member_value(member, _GROUP_ID_ALIASES)
+    division_id = _first_member_value(member, _DIVISION_ID_ALIASES)
+    dependant_number = _first_member_value(member, _DEPENDANT_NUMBER_ALIASES, "0")
     result = {
-        "group_id": str(member.get("GroupId") or member.get("groupId") or member.get("group_id") or ""),
-        "division_id": str(member.get("DivisionID") or member.get("divisionId") or member.get("division_id") or ""),
-        "dependant_number": str(member.get("DependantNumber") or member.get("dependantNumber") or
-                                member.get("dependant_number") or "0"),
+        "group_id": str(group_id),
+        "division_id": str(division_id),
+        "dependant_number": str(dependant_number),
     }
+    group_present = bool(result["group_id"])
+    division_present = bool(result["division_id"])
     if not result["group_id"] or not result["division_id"]:
         _member_failure("missing_required_fields", base=base,
                         group_id_present=group_present, division_id_present=division_present)
