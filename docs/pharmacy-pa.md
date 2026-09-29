@@ -26,7 +26,10 @@ HTTP Basic returned 401, while those custom headers returned 200. The header for
 are stale evidence for current upstream behavior. `POST /IssuePa` continues to use HTTP Basic.
 Separately, support for the `group_id`, `division_id`, and `dependant_number` response aliases comes
 from the historical Klaire Pharmacy PA parser in `apis/klaire_whatsapp/issue_pa.py::get_member_info`;
-the authentication test did not establish those aliases. The delivery PRE11 diagnosis requires an
+the authentication test did not establish those aliases. A later controlled read-only schema
+inspection established the current live top-level aliases `groupID`, `divisionID`, and
+`dependentNumber`; these normalize to the same internal fields while historical aliases remain
+supported. The delivery PRE11 diagnosis requires an
 explicit `PA_DELIVERY_DIAGNOSIS_CODE`.
 No authoritative delivery diagnosis convention was found in repository contracts.
 
