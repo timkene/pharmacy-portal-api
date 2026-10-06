@@ -8,13 +8,14 @@ import logging
 
 import httpx
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 from fastapi import APIRouter, Cookie, HTTPException
 from pydantic import BaseModel, Field
 from typing import Literal
 
 from core.database import get_db
 from core.order_lifecycle import load_order
-from core.pa_client import build_payload, get_member_info, issue_pa
+from core.pa_client import build_payload, get_member_info, issue_pa, reconcile_response
 from core.pricing import money, price_lines, subtotal
 from core.security import decode_session
 
@@ -29,10 +30,12 @@ def _utc(value):
 
 
 class VerificationResolution(BaseModel):
-    resolution: Literal["existing_pa", "confirmed_no_pa"]
+    resolution: Literal["existing_pa", "confirmed_no_pa", "confirmed_rejected"]
     evidence: str = Field(min_length=10, max_length=2000)
     paNumber: str | None = None
     confirmNoPaCreated: bool = False
+    confirmAuthoritativeAbsence: bool = False
+    reconciliationReference: str | None = None
     verificationMethod: str | None = None
     checkedWith: str | None = None
     verifiedAt: datetime | None = None
@@ -59,7 +62,7 @@ def _summary(lines):
         return "generated"
     if "submitting" in statuses:
         return "in_progress"
-    if "generated" in statuses or "failed_retryable" in statuses:
+    if "generated" in statuses or "failed_retryable" in statuses or "failed_rejected" in statuses:
         return "partial_failure"
     return "not_generated"
 
@@ -97,6 +100,7 @@ def _lines(order, provider_id):
         result.append({"lineId": med["lineId"], "procedureCode": med["procedureCode"],
                        "description": med.get("name", ""), "diagnosisCode": med["diagnosisCode"],
                        "quantity": med["quantity"], "amount": price["amount"],
+                       "diagnosisDescription": med.get("diagnosis", ""),
                        "providerId": provider_id, "status": "pending", "paNumber": None})
     method = order.get("fulfillmentType")
     if method == "delivered":
@@ -162,8 +166,8 @@ async def generate_pharmacy_pa(order_id: str, body: GenerationRequest, staff_ses
     existing = order.get("paGeneration") or {}
     old = existing.get("lines") or []
     if old:
-        if [(x["lineId"], x["procedureCode"], x["amount"], x["providerId"]) for x in old] != [
-            (x["lineId"], x["procedureCode"], x["amount"], x["providerId"]) for x in expected]:
+        if [(x["lineId"], x["procedureCode"], x["amount"], x["providerId"], x["diagnosisCode"], x["quantity"]) for x in old] != [
+            (x["lineId"], x["procedureCode"], x["amount"], x["providerId"], x["diagnosisCode"], x["quantity"]) for x in expected]:
             raise HTTPException(409, "PA inputs changed after generation began; manual review required")
         lines = old
     else:
@@ -172,6 +176,8 @@ async def generate_pharmacy_pa(order_id: str, body: GenerationRequest, staff_ses
         raise HTTPException(409, "An uncertain PA result requires verification before another submission")
     if all(x["status"] == "generated" for x in lines):
         raise HTTPException(409, "All PAs have already been generated")
+    if any(x["status"] == "failed_rejected" for x in lines):
+        raise HTTPException(409, "Rejected PA services require manual review before submission")
     now = datetime.now(timezone.utc)
     if existing.get("active") and _utc(existing.get("leaseUntil")) and _utc(existing["leaseUntil"]) > now:
         raise HTTPException(409, "PA generation is already in progress")
@@ -181,50 +187,86 @@ async def generate_pharmacy_pa(order_id: str, body: GenerationRequest, staff_ses
     try:
         member = await get_member_info(enrollee_id)
     except Exception:
-        raise HTTPException(502, "Member data for PA could not be verified; no PA was submitted") from None
+        raise HTTPException(502, "Member lookup must establish exactly one member and Group LegacyID; check lookup configuration/data. No PA was submitted") from None
+    identity = {"orderId": order_id, "enrolleeId": enrollee_id,
+                "memberId": member.get("member_id"), "groupLegacyId": member.get("group_legacy_id"),
+                "dependantNumber": member.get("dependant_number"), "providerId": provider_id}
+    if old and existing.get("inputIdentity") != identity:
+        raise HTTPException(409, "PA member identity changed or prior identity is unavailable; reconcile before resubmission")
+    for line in old:
+        group = line.get("submissionGroupId")
+        if group and not any(a.get("groupId") == group and line["lineId"] in a.get("lineIds", [])
+                             for a in existing.get("attempts", [])):
+            raise HTTPException(409, "PA submission identity is inconsistent; reconcile before resubmission")
+    eligible = [line for line in lines if line["status"] in ("pending", "failed_retryable")]
+    if not eligible:
+        raise HTTPException(409, "No PA services are eligible")
+    generation_date = datetime.now(ZoneInfo("Africa/Lagos")).date()
+    primary = eligible[0]
+    if primary["procedureCode"] == "PRE11":
+        raise HTTPException(409, "Delivery must be reconciled within its medication PA; standalone delivery submission is blocked")
+    try:
+        payload = build_payload(enrollee_id, member, primary["procedureCode"], primary["diagnosisCode"],
+                                primary["quantity"], primary["amount"], provider_id, generation_date, eligible[1:])
+    except (ValueError, RuntimeError):
+        raise HTTPException(422, "Group LegacyID or PA API credentials missing; no PA was submitted") from None
     token = str(uuid4())
     state = {"available": True, "status": _summary(lines), "active": True, "token": token,
-             "leaseUntil": now + timedelta(minutes=10), "updatedAt": now, "lines": lines}
+             "leaseUntil": now + timedelta(minutes=10), "updatedAt": now, "lines": lines, "attempts": existing.get("attempts", []), "inputIdentity": identity}
     claimed = await db.orders.update_one(
         {"_id": order["_id"], "status": "completed", "version": body.expectedVersion,
          "$or": [{"paGeneration.active": {"$ne": True}}, {"paGeneration.leaseUntil": {"$lte": now}}]},
         {"$set": {"paGeneration": state}, "$inc": {"version": 1}})
     if not claimed.matched_count:
         raise HTTPException(409, "PA generation is already in progress; refresh the order")
-    generation_date = datetime.now(ZoneInfo("Africa/Lagos")).date()
-    for line in lines:
-        if line["status"] not in ("pending", "failed_retryable"):
-            continue
-        line["status"] = "submitting"
-        line["submittedAt"] = datetime.now(timezone.utc)
-        await _save(db, order_id, token, state, actor, line, "pa_submitting")
-        payload = build_payload(enrollee_id, member, line["procedureCode"], line["diagnosisCode"],
-                                line["quantity"], line["amount"], provider_id, generation_date)
-        try:
-            line["paNumber"] = await issue_pa(payload)
-            logger.info("PA upstream returned reference orderId=%s medicationLineId=%s procedureCode=%s paReference=%s requestedAt=%s", order_id, line["lineId"], line["procedureCode"], line["paNumber"], line["submittedAt"].isoformat())
-            line["status"] = "generated"
-            line["generatedAt"] = datetime.now(timezone.utc)
-        except httpx.ConnectError:
-            # Connection establishment failed before sending the request.
-            line["status"] = "failed_retryable"
-            line["failureKind"] = "connect_error"
-        except Exception as exc:
-            # Timeouts, HTTP errors and unparseable responses can follow a successful create.
-            line["status"] = "verification_required"
-            line["failureKind"] = ("http_error" if isinstance(exc, httpx.HTTPStatusError) else
-                                   "timeout" if isinstance(exc, httpx.TimeoutException) else
-                                   "invalid_response" if isinstance(exc, ValueError) else "uncertain_upstream_result")
-            logger.warning("PA uncertain response orderId=%s medicationLineId=%s procedureCode=%s requestedAt=%s failureClass=%s httpStatus=%s responseClass=%s",
-                           order_id, line["lineId"], line["procedureCode"], line["submittedAt"].isoformat(),
-                           type(exc).__name__, exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None,
-                           line["failureKind"])
-        if line["status"] != "generated":
-            logger.warning("PA request outcome orderId=%s medicationLineId=%s procedureCode=%s requestedAt=%s failureClass=%s", order_id, line["lineId"], line["procedureCode"], line["submittedAt"].isoformat(), line.get("failureKind"))
+    # Persist every included service as submitting in ONE write before any POST.
+    submitted_at = datetime.now(timezone.utc)
+    for line in eligible:
+        line.update(status="submitting", submittedAt=submitted_at, submissionGroupId=token)
+        line.pop("failureKind", None)
+    state["status"] = "in_progress"
+    attempt = {"groupId": token, "lineIds": [x["lineId"] for x in eligible],
+               "submittedAt": submitted_at, "inputIdentity": identity}
+    state.setdefault("attempts", []).append(attempt)
+    events = [_event("pa_submitting", actor, line, submitted_at) for line in eligible]
+    written = await db.orders.update_one(
+        {"_id": order["_id"], "paGeneration.token": token},
+        {"$set": {"paGeneration": state}, "$inc": {"version": 1},
+         "$push": {"history": {"$each": events}}})
+    if not written.matched_count:
+        raise HTTPException(409, "PA ownership changed; no PA was submitted")
+    try:
+        response = await issue_pa(payload)
+        ref, outcomes = reconcile_response(response.get("data"), eligible)
+        attempt["response"] = response.get("evidence", {})
+        attempt["paNumber"] = ref
+        if ref:
+            logger.info("PA upstream returned reference orderId=%s paReference=%s requestedAt=%s", order_id, ref, submitted_at.isoformat())
+        for line in eligible:
+            status, upstream_status = outcomes[line["lineId"]]
+            line.update(status=status, groupPaNumber=ref, paNumber=ref if status == "generated" else None, upstreamStatus=upstream_status)
+            if status == "generated":
+                line["generatedAt"] = datetime.now(timezone.utc)
+            else:
+                line["failureKind"] = "explicit_rejection" if status == "failed_rejected" else "unresolved_service_outcome"
+    except Exception as exc:
+        # Even connection loss is conservative: no automatic transport retry.
+        failure = ("http_error" if isinstance(exc, httpx.HTTPStatusError) else
+                   "timeout" if isinstance(exc, httpx.TimeoutException) else
+                   "invalid_response" if isinstance(exc, ValueError) else "uncertain_upstream_result")
+        attempt.update(failureKind=failure, response=getattr(exc, "pa_evidence", {}),
+                       paNumber=getattr(exc, "pa_reference", None))
+        for line in eligible:
+            line.update(status="verification_required", failureKind=failure,
+                        groupPaNumber=attempt.get("paNumber"), paNumber=None)
+        logger.warning("PA uncertain response orderId=%s requestedAt=%s failureClass=%s httpStatus=%s",
+                       order_id, submitted_at.isoformat(), type(exc).__name__,
+                       exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None)
+    # Each save stores the entire group, so a persistence interruption cannot leave
+    # untouched members pending while their shared request may have reached upstream.
+    for line in eligible:
         line["updatedAt"] = datetime.now(timezone.utc)
         await _save(db, order_id, token, state, actor, line, f"pa_{line['status']}")
-        if line["status"] == "verification_required":
-            break
     state["active"] = False
     state["status"] = _summary(lines)
     await db.orders.update_one({"_id": order["_id"], "paGeneration.token": token},
@@ -294,29 +336,71 @@ async def verify_uncertain_pa(order_id: str, line_id: str, body: VerificationRes
         raise HTTPException(409, "PA generation is in progress")
     lines = state.get("lines") or []
     matching = [line for line in lines if line["lineId"] == line_id]
-    if len(matching) != 1 or matching[0]["status"] != "verification_required":
+    if len(matching) != 1 or matching[0]["status"] not in {"verification_required", "failed_rejected"}:
         raise HTTPException(409, "This PA line is not awaiting verification")
     line = matching[0]
-    if body.resolution == "existing_pa" and any(other is not line and other.get("paNumber") == body.paNumber.strip() for other in lines):
+    if body.resolution == "existing_pa" and any(other is not line and (other.get("groupPaNumber") or other.get("paNumber")) == body.paNumber.strip()
+            and (not line.get("submissionGroupId") or other.get("submissionGroupId") != line.get("submissionGroupId")) for other in lines):
         raise HTTPException(422, "PA reference is already used by another line")
+    if body.resolution == "confirmed_no_pa":
+        # Every recovery-eligible line may have crossed the external boundary.
+        # No provable pre-transmission retry state exists in this implementation.
+        submitted_at = _utc(line.get("submittedAt"))
+        if submitted_at is None:
+            raise HTTPException(409, "Submission timestamp unavailable; manual reconciliation is required, not automatic retry")
+        if not (body.confirmAuthoritativeAbsence and (body.reconciliationReference or "").strip()
+                and body.verifiedAt and _utc(body.verifiedAt) >= submitted_at):
+            raise HTTPException(422, "Authoritative service-absence reconciliation and source reference at or after submission are required for every attempted PA")
+    if body.resolution == "confirmed_rejected" and not ((body.verificationMethod or "").strip()
+            and (body.checkedWith or "").strip() and body.verifiedAt and body.verifiedAt.tzinfo):
+        raise HTTPException(422, "Rejection requires verification method, source and timestamp")
+    if body.resolution == "existing_pa":
+        known = {other.get("groupPaNumber") or other.get("paNumber") for other in lines if line.get("submissionGroupId")
+                 and other.get("submissionGroupId") == line["submissionGroupId"] and (other.get("groupPaNumber") or other.get("paNumber"))}
+        if known and known != {body.paNumber.strip()}:
+            raise HTTPException(422, "Reference conflicts with the shared PA")
+    if body.resolution == "existing_pa":
+        other_order = await db.orders.find_one({"_id": {"$ne": order["_id"]}, "$or": [
+            {"paGeneration.lines.paNumber": body.paNumber.strip()},
+            {"paGeneration.lines.groupPaNumber": body.paNumber.strip()},
+            {"paGeneration.attempts.paNumber": body.paNumber.strip()}]})
+        if other_order:
+            raise HTTPException(409, "PA reference is already associated with another order")
+        # Atomic reference reservation prevents simultaneous cross-order/group attachments.
+        # A version-conflicted order update may leave a reservation; retain it fail-safe.
+        owner = {"_id": body.paNumber.strip(), "orderId": str(order["_id"]),
+                 "submissionGroupId": line.get("submissionGroupId") or "legacy-line:" + line_id}
+        try:
+            await db.pa_reference_owners.insert_one(owner)
+        except DuplicateKeyError:
+            previous_owner = await db.pa_reference_owners.find_one({"_id": body.paNumber.strip()})
+            if previous_owner != owner:
+                raise HTTPException(409, "PA reference is reserved by another order/submission group") from None
     now = datetime.now(timezone.utc)
     previous_status = line["status"]
     if body.resolution == "existing_pa":
         line["status"] = "generated"
         line["paNumber"] = body.paNumber.strip()
+        line["groupPaNumber"] = body.paNumber.strip()
         line["generatedAt"] = now
+    elif body.resolution == "confirmed_rejected":
+        line["status"] = "failed_rejected"
+        line["paNumber"] = None
     else:
         line["status"] = "failed_retryable"
+        line["paNumber"] = None
     line["updatedAt"] = now
     state["status"] = _summary(lines)
     state["updatedAt"] = now
     event = {**_event("pa_manually_verified", actor, line, now),
              "resolution": body.resolution, "evidence": evidence, "previousStatus": previous_status,
              "verificationMethod": body.verificationMethod, "checkedWith": body.checkedWith,
-             "verifiedAt": body.verifiedAt, "confirmNoPaCreated": body.confirmNoPaCreated}
+             "verifiedAt": body.verifiedAt, "confirmNoPaCreated": body.confirmNoPaCreated,
+             "confirmAuthoritativeAbsence": body.confirmAuthoritativeAbsence,
+             "reconciliationReference": body.reconciliationReference}
     result = await db.orders.update_one(
         {"_id": order["_id"], "version": order.get("version"), "paGeneration.active": False},
         {"$set": {"paGeneration": state}, "$inc": {"version": 1}, "$push": {"history": event}})
     if not result.matched_count:
         raise HTTPException(409, "Order changed; verify again before recovery")
-    return {"status": state["status"], "line": line}
+    return {"status": state["status"], "line": next(x for x in public_pa_state({"paGeneration": state})["lines"] if x["lineId"] == line_id)}
