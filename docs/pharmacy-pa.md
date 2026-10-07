@@ -291,3 +291,79 @@ For an unknown commit result, inspect persisted state before repeating an action
 No external side effects are retried. Required index creation fails closed with
 collection/index context if a safety index fails. Real replica-set transaction
 validation remains a production prerequisite; mocks do not prove server behavior.
+
+## Phase 2: staff preparation APIs
+
+The application registers seven operations under `/api/pa-preparation`:
+
+- `POST /batches` (`businessDate`)
+- `GET /batches`
+- `GET /batches/{batch_id}`
+- `GET /batches/{batch_id}/lines`
+- `POST /batches/{batch_id}/orders/{order_id}/prepare`
+- `POST /batches/{batch_id}/orders/{order_id}/recalculate`
+- `POST /batches/{batch_id}/close`
+
+Mutation requests except creation require the current batch `expectedVersion`.
+There is no IssuePa, recovery, export, import, catalog or mapping-activation
+operation in this router. Existing transmission routes remain unchanged.
+
+Every operation requires a valid signed staff session and an existing staff
+record. Authorization reads `staff_users.permissions` on each request:
+`PA_PREPARATION_READ` permits reads; `PA_PREPARATION_WRITE` permits mutations.
+Neither capability is inferred from staff status, request JSON or signed cookie
+permission claims. Absent permissions deny access. Assigning these permissions
+requires separately authorized administration; this implementation does not
+modify staff records or expose a permission-management route. A writer without
+READ cannot receive another batch's ownership identifier in conflict responses.
+No catalog/mapping privilege is granted to the domain Actor by these routes.
+
+The existing `get_member_info` interface returns only three normalized identity
+fields, not the complete Phase 1 MemberEvidence contract. Phase 2 therefore
+fails closed with `MEMBER_VALIDATION_UNAVAILABLE` and BLOCKED preparation until
+a trusted server-side full-evidence adapter is integrated through the
+`member_validation_source` dependency. The default adapter performs no network
+call. Client JSON cannot provide member evidence. The Mac is not a runtime
+dependency. Tests override this dependency with minimized authoritative fixtures.
+Current freshness timestamps come only from the evidence used for the current
+request/recalculation, never from an old preparation row's receipt.
+
+Missing source namespaces remain unmapped/review-required without a global
+fallback. Other blocking validations take precedence in the overall status.
+Malformed legacy medication codes/names and assignment identifiers fail closed
+without repairing source orders. Line totals remain snapshots of existing
+approved/final values, with no quantity multiplication or tariff comparison.
+
+Line responses are allowlisted and contain IDs/revisions, provider/aggregator
+context, medication/price snapshots, mapping lifecycle and validation states,
+reason codes, stale status and advisory eligibility. They omit member identities,
+PHI, hashes, raw upstream evidence, credentials and audit payloads. Transmission
+projection reads only line status and a confirmed generated reference from the
+canonical `orders.paGeneration`; it never changes transmission or retry state.
+A stale row cannot be presented as READY or submission eligible. Source snapshot
+values retain `calculatedAt`; current validation is evaluated independently.
+
+Batch lists use `_id` cursors, with limits 1–100. Line pages use UUID `_id`
+cursors and limits 1–50. A request scans at most 100 stored candidates; filters
+are evaluated against safe current projections. An empty filtered page can have
+a next cursor and must be followed. Historical superseded revisions are skipped;
+latest stale/invalidated rows remain visible. Supported filters are `status`,
+`mappingStatus`, `aggregatorId`, `providerId` (IssuePa provider), and `stale`.
+A batch/id index supports scans. Within a page, each order is evaluated once.
+
+Batch counts are explicitly LAST_CALCULATION with `countsAsOf`; they are not
+live eligibility evidence. Submitted, verification and stale totals are null
+when not calculated, rather than invented. `pageCounts` provides exact counts
+for returned rows without an unbounded batch aggregation. Future frontend code
+must distinguish page counts from batch totals.
+
+Storage errors produce sanitized 503 responses, domain/ownership/version
+conflicts produce 409, absent resources 404, and authentication/authorization
+failures 401/403. Invalid request bodies/parameters return sanitized 422 errors
+without echoing unknown evidence or credential fields. Responses use no-store
+caching. No real MongoDB/MediCloud validation or deployment occurred in Phase 2.
+
+
+Phase 2 review clarifications: WRITE permission permits a mutation and its minimized result response; it does not grant access to standalone GET/list endpoints, which require READ. Mapping status and target fields reflect the current line's effective validation, not the existence of an active mapping head. REVIEW_REQUIRED is a preparation status, not a mapping filter. Invalid or inconsistent PA ledgers project UNKNOWN with verification required and no reference, without repair. Invalid stored preparation rows are isolated as BLOCKED/PREPARATION_ROW_INVALID with minimized identifiers, preserving other page rows.
+
+Deferred before production volume/frontend work: sequential per-row query performance and random-ID pagination/date ordering. Catalog ingestion cleanup and single-order ownership release remain deferred.

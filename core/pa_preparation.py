@@ -145,7 +145,7 @@ def price_evidence(order):
             if money(order.get("overallTotal")) != money(subtotal(valid) + float(fee)):
                 raise ValueError("Overall total mismatch")
         return {r["medicationLineId"]: format(money(r["amount"]), ".2f") for r in valid}, source, True
-    except (HTTPException, ValueError, TypeError, KeyError):
+    except (HTTPException, ValueError, TypeError, KeyError, AttributeError):
         return {}, source, False
 
 
@@ -167,14 +167,37 @@ async def calculate(db, order, aggregator, evidence, session, now, catalog_snaps
     ledger_invalid = (raw_ledger is not None and not isinstance(raw_ledger, dict)) or not isinstance(raw_lines, list)
     ledger_lines = raw_lines if isinstance(raw_lines, list) else []
     ledger_invalid = ledger_invalid or any(not isinstance(r, dict) for r in ledger_lines)
+    ledger_ids = set()
+    for entry in ledger_lines:
+        if not isinstance(entry, dict):
+            continue
+        identity, state, reference = entry.get("lineId"), entry.get("status"), entry.get("paNumber")
+        if (not isinstance(identity, str) or not identity.strip() or identity in ledger_ids
+                or state not in ("pending", "submitting", "generated", "verification_required", "failed_rejected", "failed_retryable")
+                or (state == "generated" and (not isinstance(reference, str) or not reference.strip()))
+                or (state != "generated" and reference not in (None, ""))):
+            ledger_invalid = True
+        if isinstance(identity, str): ledger_ids.add(identity)
     transmitted = ledger_invalid or bool(attempts) or any(r.get("submittedAt") or r.get("submissionGroupId")
         or r.get("status") not in (None, "pending") for r in ledger_lines if isinstance(r, dict))
-    duplicate_ids = len({m.get("lineId") for m in meds}) != len(meds)
+    meds = [m if isinstance(m, dict) else {} for m in meds]
+    duplicate_ids = len({m.get("lineId") for m in meds if isinstance(m.get("lineId"), str)}) != len(meds)
     result = []
     for position, med in enumerate(meds):
         blocked, review = [], []
+        malformed = any(med.get(key) is not None and not isinstance(med.get(key), str)
+                        for key in ("procedureCode", "sourceCode", "name", "sourceDescription", "sourceNamespaceId", "lineId"))
+        if malformed or not isinstance(med.get("name"), str) or not med.get("name", "").strip():
+            blocked.append("LEGACY_MEDICATION_FIELDS_INVALID")
+        med = dict(med)
+        for key in ("procedureCode", "sourceCode", "name", "sourceDescription", "sourceNamespaceId", "lineId"):
+            if key in med and not isinstance(med[key], str):
+                med[key] = None
+
         if not member_valid:
             blocked.append("MEMBER_EVIDENCE_INVALID_OR_STALE")
+        if not ObjectId.is_valid(order.get("winnerId")):
+            blocked.append("ASSIGNMENT_IDENTITY_INVALID")
         if not provider_valid:
             blocked.append("ISSUEPA_PROVIDER_UNCONFIGURED")
         if not prices_valid:
@@ -186,7 +209,7 @@ async def calculate(db, order, aggregator, evidence, session, now, catalog_snaps
             blocked.append("MEDICATION_IDENTITY_INVALID")
         # Existing procedureCode remains the priced source code. Never mutate it.
         source_code = med.get("sourceCode", med.get("procedureCode"))
-        description = med.get("sourceDescription", med.get("name", ""))
+        description = med.get("sourceDescription") or med.get("name") or ""
         namespace = med.get("sourceNamespaceId")
         identity_type = "CODE" if source_code else "DESCRIPTION"
         identity_key = normalized_code(source_code) if isinstance(source_code, str) and source_code.strip() else str(description).strip().casefold()
@@ -227,7 +250,7 @@ async def calculate(db, order, aggregator, evidence, session, now, catalog_snaps
         fields = {"orderId": str(order["_id"]), "orderLineId": med.get("lineId") or f"invalid-{position}",
             "orderVersion": order.get("version", 0), "assignmentVersion": order.get("assignmentVersion", 0),
             "referringProviderId": referring["providerId"].strip() if isinstance(referring, dict) and isinstance(referring.get("providerId"), str) else None,
-            "aggregatorId": order.get("winnerId"), "issuePaProviderId": provider,
+            "aggregatorId": order.get("winnerId") if isinstance(order.get("winnerId"), str) else None, "issuePaProviderId": provider,
             "sourceNamespaceId": namespace, "sourceIdentityType": identity_type,
             "sourceIdentityKey": identity_key, "sourceCode": source_code, "sourceDescription": description,
             "diagnosisCode": med.get("diagnosisCode").strip() if isinstance(med.get("diagnosisCode"), str) else None, "quantity": med.get("quantity") if type(med.get("quantity")) is int else None,
@@ -249,7 +272,7 @@ async def calculate(db, order, aggregator, evidence, session, now, catalog_snaps
             "preparationStatus": "BLOCKED" if blocked else "REVIEW_REQUIRED" if review else "READY",
             "blockingReasons": sorted(blocked), "reviewReasons": sorted(review),
             "submissionEligible": False, "submissionEligibilityReasons": []}
-        fields["inputFingerprint"] = fingerprint({**material_fields(fields), "orderStatus": order.get("status"),
+        fields["inputFingerprint"] = fingerprint({**material_fields(fields), "rawMedicationFingerprint": fingerprint(meds[position]), "rawAssignmentFingerprint": fingerprint(order.get("winnerId")), "orderStatus": order.get("status"),
             "pricingEvidence": {key: order.get(key) for key in ("approvedProcedurePrices", "finalProcedurePrices", "medicationSubtotal")},
             "priceApprovedAt": order.get("priceApprovedAt"), "fulfillmentType": order.get("fulfillmentType"),
             "deliveryFee": order.get("deliveryFee"), "overallTotal": order.get("overallTotal"),

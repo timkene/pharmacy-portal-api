@@ -28,6 +28,7 @@ async def ensure_preparation_indexes(db):
         "pa_preparation_batches": [([("businessDate", 1), ("status", 1)], {}),
                                    ([("createdBy", 1), ("createdAt", -1)], {})],
         "pa_preparation_lines": [
+            ([("batchId", 1), ("_id", 1)], {}),
             ([("batchId", 1), ("orderId", 1), ("orderLineId", 1), ("revision", 1)], {"unique": True}),
             ([("batchId", 1), ("orderId", 1), ("orderLineId", 1)],
              {"unique": True, "partialFilterExpression": {"isCurrent": True}}),
