@@ -2,6 +2,8 @@ import os
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 
+from core.pa_preparation_store import ensure_preparation_indexes
+
 load_dotenv()
 
 _client: AsyncIOMotorClient | None = None
@@ -20,6 +22,7 @@ async def connect_db():
     await _db.aggregator_users.create_index("email", unique=True)
     await _db.orders.create_index("intakeId", unique=True)
     await _db.bids.create_index([("orderId", 1), ("aggregatorId", 1)])
+    await ensure_preparation_indexes(_db)
 
 
 async def close_db():

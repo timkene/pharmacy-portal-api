@@ -176,3 +176,118 @@ Services / AdditionalServices response adapters remain hypothetical, conservativ
 adapters rather than confirmed MediCloud semantics. Unknown or group-only success
 remains verification_required. Existing authoritative-absence reconciliation and
 no-automatic-retry protections are unchanged.
+
+## Phase 1: internal preparation persistence
+
+Phase 1 adds internal services only; no preparation, catalog, mapping-import,
+export or frontend routes are exposed. `core.pa_preparation` reads orders and
+appends preparation evidence. `core.pa_mapping` accepts internally attested
+procedure extracts and human-reviewed mapping inputs. Neither module sends
+IssuePa. Existing `orders.paGeneration` and `pa_reference_owners` remain the
+only transmission/reference authority and are never written by these services.
+
+The core collections are `pa_preparation_batches`, `pa_preparation_lines`,
+`pa_mapping_versions`, `pa_mapping_heads`, `pa_procedure_catalog_snapshots`,
+`pa_procedure_catalog_entries`, and `pa_preparation_events`. Review adds
+`pa_catalog_validation_evidence` and `pa_preparation_contexts`. Index creation is
+additive/idempotent at database startup. Phase 1 publication requires a
+transaction-capable MongoDB replica set or sharded cluster; there is no unsafe
+nontransactional fallback. No database migration or reference-data population
+is executed by this implementation task.
+
+Internal `Actor` permissions must come from authenticated server authorization;
+never construct them from uploaded rows. Preparation, proposal, catalog ingestion,
+catalog validation, catalog trust and mapping review are explicit capabilities.
+Mapping review alone does not grant catalog validation/trust authority. `MemberEvidence` must be constructed
+by trusted lookup-validation code through the minimized adapter, not accepted
+from clients. Its validity interval and source evidence reference are required.
+Member evidence validity is capped by `MEMBER_EVIDENCE_MAX_AGE` (one hour).
+Material member identity/eligibility enters the preparation fingerprint; retrieval
+IDs and timestamps do not. Fresh equivalent evidence reuses the preparation
+revision, while its evidence ID/validity times are persisted in a separate audit
+event. Historical preparation evidence is not overwritten.
+An enrollee fingerprint is restricted integrity evidence, not anonymization.
+No member name, contact, DOB, address or raw enrollee identifier is duplicated.
+
+Procedure extracts use only MediCloud `dbo.proceduredata` canonical codes and
+descriptions. The internal attestation includes extraction time, source evidence
+reference, record count and content hash. `catalog_hash` hashes sorted exact
+code/description pairs as compact UTF-8 JSON; extraction tools must use this
+contract. Any normalized duplicate (including identical duplicates), missing
+real description, code-as-description fallback, count/hash mismatch or invalid
+extraction metadata produces an INVALID snapshot with no usable entries.
+Matching a caller-supplied hash/count establishes structural validity only.
+
+Catalog ingestion publishes an INGESTING header, then commits bounded chunks of
+at most 1,000 entries in separate transactions. Only complete ingestion becomes
+VALIDATED. Failed/partial ingestion stays unusable; no giant insertion transaction
+is required. Prior TRUSTED snapshots and mapping evidence remain intact.
+
+TRUSTED promotion is a separate privileged action, requiring registered
+`CatalogValidationEvidence` from a validator context with the
+SERVER_CONTROLLED_MEDICLOUD_EXTRACTION method, source/extraction metadata,
+content hash, record count, schema version, validator identity/time and evidence
+ID. Promotion checks persisted completeness/hash and binds the validation record.
+A generic mapping reviewer or uploader cannot perform this action. Phase 1 has
+no actual extraction validator or route: Phase 4 must establish server-controlled
+provenance before issuing this evidence and define snapshot freshness. Tests use
+an explicitly privileged fixture. Separate capabilities do not mandate different
+people; no two-person approval policy is introduced.
+
+Mapping versions are append-only. The unique namespace/type/key head records
+both the latest revision and active revision. ACTIVE cannot become REJECTED. Only never-activated PROPOSED/VALIDATED
+candidates can be rejected. An explicit replacement proposal clears prior
+canonical validation fields and preserves the active head until a valid
+replacement activation; RETIRED releases it. Returned revision state explicitly
+reports `activeVersion` and `isActive`.
+Activation requires trusted canonical evidence and explicit matching human
+reviewer evidence. AI/fuzzy confidence alone cannot activate. Canonical target
+description comes from the catalog. Description identities use conservative
+trim/casefold comparison; source code identities use trim/uppercase. No fuzzy
+identity equivalence is inferred.
+
+Preparation retains approved/final line totals as exact two-decimal strings,
+without multiplying by quantity or replacing prices. Legacy aggregate quotes
+are not approved line-price evidence. Source namespace is explicit: an existing
+order without one requires review rather than guessing code ownership.
+Referring provider, aggregator and configured IssuePa provider remain distinct.
+Provider validation here establishes configured identity only; tariff eligibility
+and tariff price comparison are explicitly NOT_IMPLEMENTED.
+
+Reserved delivery PRE11 is prepared separately using the existing delivery fee
+and `PA_DELIVERY_DIAGNOSIS_CODE`. It requires a trusted canonical PRE11 entry
+from an explicitly supplied snapshot or the single common medication mapping
+snapshot. Medication mappings cannot make PRE11 eligible as a medication.
+
+Preparation states are READY, REVIEW_REQUIRED and BLOCKED. `submissionEligible`
+is advisory as-of calculation, requires a completed order and all services ready,
+and does not grant IssuePa or retry permission. Any existing attempt/transmitted
+line blocks preparation eligibility for controlled submission/recovery handling.
+Actual transmission integration is deferred to Phase 6; the existing PA API is
+unchanged and is not gated by Phase 1 preparation yet.
+
+An order has one active preparation context across OPEN/AUDITING batches.
+`pa_preparation_contexts._id` is the canonical order ID and supplies MongoDB
+uniqueness; its batch lookup is indexed. Claiming ownership and publishing lines
+commit together. `close_batch` atomically closes the batch and releases ownership
+without changing historical line evidence. Later batches can then claim it.
+All batch closing must use this domain operation rather than raw status updates.
+
+Batch version compare-and-set serializes recalculation. Revisions retain immutable
+evidence; only `isCurrent`/`staleReason` publication metadata changes. Identical
+inputs reuse a revision. Mapping activation/retirement invalidates current
+preparations. Order/member/provider changes and released batch ownership are detected by `current_lines`;
+future team APIs must use that accessor rather than trusting raw `isCurrent`
+flags or last-calculated batch counts. Counts are as-of recalculation. Future
+submission must independently revalidate source versions, member freshness and
+all existing ledger/reconciliation safeguards immediately before claiming.
+
+Audit events are separate append-oriented documents, using Mongo `_id` as event
+identity and bounded allowlisted references. Publication, version heads and
+related audit events commit together. The mocked transaction tests verify CAS,
+rollback and unique-index contracts. Duplicate-key, write-conflict and Mongo
+transient/unknown-commit labels become `DomainConflict` without automatic retry.
+For an unknown commit result, inspect persisted state before repeating an action.
+No external side effects are retried. Required index creation fails closed with
+collection/index context if a safety index fails. Real replica-set transaction
+validation remains a production prerequisite; mocks do not prove server behavior.
