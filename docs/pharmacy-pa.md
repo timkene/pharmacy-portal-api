@@ -367,3 +367,46 @@ caching. No real MongoDB/MediCloud validation or deployment occurred in Phase 2.
 Phase 2 review clarifications: WRITE permission permits a mutation and its minimized result response; it does not grant access to standalone GET/list endpoints, which require READ. Mapping status and target fields reflect the current line's effective validation, not the existence of an active mapping head. REVIEW_REQUIRED is a preparation status, not a mapping filter. Invalid or inconsistent PA ledgers project UNKNOWN with verification required and no reference, without repair. Invalid stored preparation rows are isolated as BLOCKED/PREPARATION_ROW_INVALID with minimized identifiers, preserving other page rows.
 
 Deferred before production volume/frontend work: sequential per-row query performance and random-ID pagination/date ordering. Catalog ingestion cleanup and single-order ownership release remain deferred.
+
+### Phase 3A — mapping review transfer (backend only)
+
+The normal backend stores bounded review manifests and proposed versions in MongoDB. No Mac or live MediCloud connection is needed. This phase does not validate procedure existence, promote catalog trust, activate mappings, export member information, change pricing, or submit/retry PAs. Suggested descriptions remain suggestions; canonical descriptions can only come from the separately trusted catalog in a later authorized review.
+
+Staff permissions are independent, default-deny, and read from the authoritative staff record:
+
+- `PA_MAPPING_EXPORT`: create/download mapping review exports.
+- `PA_MAPPING_IMPORT`: import proposals/read import status.
+
+Existing preparation permissions and its seven routes are unchanged. New routes are:
+
+- `POST /api/pa-mapping-review/batches/{batch_id}/exports`: JSON `expectedVersion`, optional UUID `after`, and `limit` (1–100, default 50).
+- `GET /api/pa-mapping-review/exports/{export_id}/download`: authenticated download, no public link.
+- `POST /api/pa-mapping-review/exports/{export_id}/imports`: raw UTF-8 `text/csv` body, not multipart. Streaming input is capped before parsing; no upload spool files.
+- `GET /api/pa-mapping-review/exports/{export_id}/import-status`.
+
+The format is UTF-8 CSV with an exact, ordered header. Server exports use CRLF and standard CSV quoting. UTF-8 BOM on import is supported. Keep every protected cell and every exported row unchanged; row ordering may change. Source spreadsheet-formula prefixes are escaped with an apostrophe, which is itself protected. Embedded control characters, malformed UTF-8, unexpected headers/extra cells, duplicate/missing/added rows, oversized files, and malformed proposals are rejected. File size is capped at 512 KiB, exports/imports at 100 rows, and creation scans at most 200 preparation candidates per transaction. The response's `nextCursor` advances over scanned preparation IDs; export scope is immutable, not a chronological pagination guarantee. Exports expire after 24 hours. They and their audit evidence are retained, not TTL-deleted.
+
+Exact columns, in order:
+
+```text
+schema_version,export_id,export_row_id,expires_at,batch_id,preparation_line_id,preparation_revision,order_id,order_line_id,referring_provider_id,aggregator_id,issue_pa_provider_id,source_namespace_id,source_identity_type,source_identity_key,source_code,source_description,existing_mapping_id,existing_mapping_version,existing_mapping_status,proposed_medicloud_code,proposed_medicloud_description,mapping_notes
+```
+
+Only `proposed_medicloud_code`, `proposed_medicloud_description`, and `mapping_notes` are editable. They convey no authorization. Codes preserve case and must already be trimmed, match the conservative ASCII code syntax, and cannot target reserved PRE11. Descriptions may be absent; they are never fabricated or substituted with the code. Blank codes remain unresolved; a description without a code is rejected. Notes/descriptions are bounded to 1,000 characters, codes to 200. Do not put member data or secrets in these fields.
+
+Exports include only current, source-bound rows needing mapping review. Missing namespace, invalid price/provider/medication identity, and PA-ledger cases are excluded. An unavailable/stale member receipt can coexist with an independently actionable mapping review; exporting such a row neither asserts eligibility nor makes it ready for submission. The stored member receipt is used only to reproduce preparation at its original calculation time and is never exported. Source drift requires recalculation before export/import.
+
+Server-held manifests bind opaque export/row IDs, expiry, protected cells, scope, preparation IDs/revisions, material input fingerprints and mapping head/latest-version evidence. They retain SHA-256 content/protected/scope digests. A client manifest is never accepted. Downloads and first imports recheck current ownership, sources, revisions and mapping evidence. The batch transaction guard serializes with recalculation/closure; source reads are snapshot-consistent as of validation. Later mapping activation/submission must independently revalidate current source state; a proposal receipt is not a freshness or eligibility certificate.
+
+All proposals in an import, the receipt, manifest state change and audit events commit together through the mandatory Mongo transaction primitive. No nontransactional fallback or automatic retry is used. Driver write conflicts become domain conflicts. Real replica-set transaction/concurrency validation remains a production prerequisite; in-memory tests do not establish real Mongo isolation behavior.
+
+Imports append immutable `PROPOSED` versions with CURSOR source and `CURSOR_PROPOSAL` provenance, uploader/time/export/row references and suggested text. Existing heads, including ACTIVE heads, are left entirely unchanged. A previously unmapped identity gets a nonactive head. Pending versions are not current/active authority. Version allocation uses the highest immutable version, allowing existing explicit lifecycle operations to coexist with pending proposals. A later review workflow must explicitly select/review a pending proposal; import never selects it for activation. Namespace-identical rows with identical suggestions coalesce; inconsistent suggestions/source identities reject the entire import. Latest-version binding prevents conflicting imports from separate outstanding exports from silently racing.
+
+An identical repeat for the same unexpired, intact export returns the original receipt without new versions or audit writes. Different repeat content conflicts. Blank proposals produce unresolved counts. Append-oriented events record export creation/download, imported proposal versions and import completion with bounded export/row references; raw files/member/PA evidence are not audit payloads. Server receipts expose counts/status only.
+
+Export creation JSON bodies are capped at 4 KiB, including streamed requests. A bounded scan with no eligible rows but more candidates returns `EMPTY_SCAN`, no export ID/file, and a `nextCursor`; callers continue scanning with the same batch version. A fully exhausted scope with no eligible valid rows returns `EMPTY`, no export ID/file, and zero exported rows. Both empty and nonempty results report `skippedRows` and bounded, machine-readable `skipReasons` counts.
+
+
+Phase 3A review fixes: manifest creation/expiry timestamps are normalized to UTC millisecond precision before expiry calculation or hashing. Digest verification uses the same exact canonical UTC representation and rejects non-millisecond timestamps rather than rounding altered values. The 24-hour expiry and integrity checks remain strict across BSON datetime storage.
+
+Export candidates are isolated individually: stale/malformed rows, invalid mapping identities, unrepresentable CSV cells and rows exceeding the remaining file budget are skipped without modifying preparation history. Valid rows alone enter the immutable manifest. Skip diagnostics contain static reason/count pairs, never row contents or exception text; counts are retained in the manifest and append-oriented export/empty-scan events. Mongo driver failures still abort the transaction. Import/download scope validation remains strict for every actually exported row.

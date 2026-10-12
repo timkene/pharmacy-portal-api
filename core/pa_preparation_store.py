@@ -18,11 +18,14 @@ COLLECTIONS = (
     "pa_mapping_heads", "pa_procedure_catalog_snapshots",
     "pa_procedure_catalog_entries", "pa_preparation_events",
     "pa_catalog_validation_evidence", "pa_preparation_contexts",
+    "pa_mapping_review_exports", "pa_mapping_review_imports",
 )
 
 
 async def ensure_preparation_indexes(db):
     indexes = {
+        "pa_mapping_review_exports": [([("batchId", 1), ("createdAt", -1)], {}), ([("expiresAt", 1)], {})],
+        "pa_mapping_review_imports": [([("importId", 1)], {"unique": True})],
         "pa_preparation_contexts": [([("batchId", 1)], {})],
         "pa_catalog_validation_evidence": [([("snapshotId", 1), ("validationEvidenceId", 1)], {"unique": True})],
         "pa_preparation_batches": [([("businessDate", 1), ("status", 1)], {}),
@@ -74,7 +77,8 @@ def now_utc():
 
 async def event(db, session, actor, kind, correlation_id, **refs):
     allowed = {"batchId", "preparationLineId", "preparationRevision", "mappingId",
-               "previousVersion", "newVersion", "reason", "snapshotId", "memberEvidence"}
+               "previousVersion", "newVersion", "reason", "snapshotId", "memberEvidence",
+               "exportId", "importId", "exportRowIds", "rowCount", "skippedRows", "skipReasons"}
     if set(refs) - allowed:
         raise ValueError("Unexpected audit evidence")
     doc = {"_id": str(uuid4()), "eventType": kind, "timestamp": now_utc(),

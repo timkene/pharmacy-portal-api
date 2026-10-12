@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from api import aggregator, auth, orders, pa, pa_preparation, search
+from api import aggregator, auth, orders, pa, pa_preparation, pa_mapping_review, search
 from core.database import close_db, connect_db
 from core.security import validate_session_secret
 
@@ -34,6 +34,7 @@ app.include_router(auth.router, prefix="/api/auth")
 app.include_router(orders.router, prefix="/api")
 app.include_router(pa.router, prefix="/api")
 app.include_router(pa_preparation.router, prefix="/api")
+app.include_router(pa_mapping_review.router, prefix="/api")
 app.include_router(aggregator.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 

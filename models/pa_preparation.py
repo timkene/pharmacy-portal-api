@@ -28,6 +28,8 @@ class Actor(StrictModel):
     # Construct from authenticated server context, never an uploaded row.
     actorId: str = Field(min_length=1, max_length=200)
     canPrepare: bool = Field(default=False, strict=True)
+    canExportMappings: bool = Field(default=False, strict=True)
+    canImportMappings: bool = Field(default=False, strict=True)
     canProposeMappings: bool = Field(default=False, strict=True)
     canIngestCatalog: bool = Field(default=False, strict=True)
     canValidateCatalog: bool = Field(default=False, strict=True)

@@ -185,6 +185,12 @@ async def propose_mapping(db, actor, proposal: MappingProposal):
     return doc
 
 
+async def next_mapping_version(db, mapping_id, session):
+    # Pending imported proposals may be newer than the active/current head.
+    versions = await db.pa_mapping_versions.find({'mappingId': mapping_id}, session=session).sort('version', -1).limit(1).to_list(1)
+    return versions[0]['version'] + 1 if versions else 1
+
+
 async def revise_mapping(db, actor, mapping_id, expected_version, status, *, snapshot_id=None,
                          review: ReviewEvidence | None = None, replacement: MappingProposal | None = None):
     """Append a version and CAS the head. Review is required even for AI confidence=1."""
@@ -203,7 +209,7 @@ async def revise_mapping(db, actor, mapping_id, expected_version, status, *, sna
             raise DomainConflict("ACTIVE_MAPPING_REQUIRES_RETIREMENT_OR_REPLACEMENT")
         if status in {"PROPOSED", "VALIDATED"} and previous["status"] == "ACTIVE" and not replacement:
             raise DomainConflict("EXPLICIT_REPLACEMENT_PROPOSAL_REQUIRED")
-        doc = {**previous, "_id": str(uuid4()), "version": expected_version + 1,
+        doc = {**previous, "_id": str(uuid4()), "version": await next_mapping_version(db, mapping_id, session),
                "status": status, "createdAt": now_utc(), "createdBy": actor.actorId}
         if replacement:
             if replacement.identity.model_dump() != {k: head[k] for k in replacement.identity.model_dump()}:

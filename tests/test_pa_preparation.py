@@ -17,15 +17,24 @@ from models.pa_preparation import (Actor, CatalogEvidence, MappingIdentity, Mapp
 
 
 def matches(doc, query):
-    return all(doc.get(k) == v for k, v in query.items())
+    return all((doc.get(k) is not None and type(doc[k]) is type(v["$gt"]) and doc[k] > v["$gt"])
+               if isinstance(v, dict) and "$gt" in v else doc.get(k) == v for k, v in query.items())
 
 
 class Cursor:
     def __init__(self, rows):
         self.rows = deepcopy(rows)
 
+    def sort(self, key, direction):
+        self.rows.sort(key=lambda row: row[key], reverse=direction < 0)
+        return self
+
+    def limit(self, count):
+        self.rows = self.rows[:count]
+        return self
+
     async def to_list(self, length):
-        return deepcopy(self.rows)
+        return deepcopy(self.rows if length is None else self.rows[:length])
 
 
 class Collection:
