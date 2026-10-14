@@ -61,9 +61,11 @@ async def ensure_preparation_indexes(db):
 async def transaction(db):
     # No nontransactional fallback. A replica set / transaction-capable Mongo is required.
     try:
-        async with await db.client.start_session() as session:
-            async with session.start_transaction():
-                yield session
+        from core.pa_catalog_provenance import catalog_verification_scope
+        async with catalog_verification_scope():
+            async with await db.client.start_session() as session:
+                async with session.start_transaction():
+                    yield session
     except PyMongoError as exc:
         if (isinstance(exc, DuplicateKeyError) or exc.has_error_label("TransientTransactionError")
                 or exc.has_error_label("UnknownTransactionCommitResult") or getattr(exc, "code", None) in {112, 244, 251}):

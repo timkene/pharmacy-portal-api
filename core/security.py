@@ -87,3 +87,11 @@ def generate_intake_id() -> str:
 def generate_code(length: int) -> str:
     chars = string.ascii_uppercase + string.digits
     return "".join(random.choices(chars, k=length))
+
+
+# Existing browser origins, shared by CORS and cookie-authenticated catalog mutations.
+STAFF_BROWSER_ORIGINS = (
+    "http://localhost:3000",
+    "https://pharmacy-portal-delta.vercel.app",
+    "https://cil-frontend.vercel.app",
+)

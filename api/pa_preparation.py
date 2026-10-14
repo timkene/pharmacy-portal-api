@@ -9,6 +9,7 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Response
 from pymongo.errors import PyMongoError
 
 from core.database import get_db
+from core.pa_catalog_provenance import catalog_verification_scope
 from core.security import decode_session
 from core import pa_preparation as domain
 from core.pa_preparation_store import DomainConflict, now_utc
@@ -20,7 +21,8 @@ class SafePreparationRoute(APIRoute):
         handler = super().get_route_handler()
         async def safe(request):
             try:
-                return await handler(request)
+                async with catalog_verification_scope():
+                    return await handler(request)
             except PyMongoError:
                 raise HTTPException(503, "Preparation storage unavailable") from None
             except RequestValidationError:

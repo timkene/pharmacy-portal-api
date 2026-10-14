@@ -410,3 +410,72 @@ Export creation JSON bodies are capped at 4 KiB, including streamed requests. A 
 Phase 3A review fixes: manifest creation/expiry timestamps are normalized to UTC millisecond precision before expiry calculation or hashing. Digest verification uses the same exact canonical UTC representation and rejects non-millisecond timestamps rather than rounding altered values. The 24-hour expiry and integrity checks remain strict across BSON datetime storage.
 
 Export candidates are isolated individually: stale/malformed rows, invalid mapping identities, unrepresentable CSV cells and rows exceeding the remaining file budget are skipped without modifying preparation history. Valid rows alone enter the immutable manifest. Skip diagnostics contain static reason/count pairs, never row contents or exception text; counts are retained in the manifest and append-oriented export/empty-scan events. Mongo driver failures still abort the transaction. Import/download scope validation remains strict for every actually exported row.
+
+### Phase 3B foundation — signed offline procedure catalog
+
+This foundation adds only catalog extraction, signed-provenance verification and independent catalog validation/trust. It adds no mapping approval or activation endpoint. Existing priced orders, quantities, PA ledgers and PA reference ownership are untouched.
+
+An authorized offline workstation extracts only `procedurecode` and `proceduredesc` from `dbo.proceduredata`. `benefitcode_procedure` is not the catalog authority. The workstation is not a normal backend/team runtime dependency. Server requests use immutable Mongo catalog entries and signed evidence; they never connect to SQL or the Mac.
+
+The extractor is `python -m scripts.extract_pa_catalog`, with required `--secrets-file`, `--private-key-file`, and `--output-file` paths. It reads only the existing TOML `credentials.server/database/username/password/port` in memory, uses ODBC Driver 18 with `Encrypt=yes;TrustServerCertificate=no`, and never emits credentials/connection strings. It does not generate keys. The existing Ed25519 private key must be outside the primary repository and its linked worktrees. Encrypted PEM keys may use the transient `PA_CATALOG_SIGNING_KEY_PASSPHRASE` environment variable. The private key and passphrase are never placed in the artifact or logs. The output is created exclusively (no overwrite) and contains only procedure data and public provenance.
+
+ODBC Driver 18 and pyodbc are offline workstation requirements; `scripts/requirements-pa-catalog-extractor.txt` lists the Python dependency. Nothing was installed and no extraction was run as part of implementation. The backend requires `cryptography` but does not import pyodbc. Provisioning signing keys, TLS/ODBC readiness and read-only SQL access are separate authorized operational steps.
+
+Server/workstation authority configuration is explicit and has no production defaults:
+
+- `PA_CATALOG_PUBLIC_KEY_PATH`: provisioned Ed25519 public PEM verification key.
+- `PA_CATALOG_AUTHORITY_ID`: approved source authority identifier.
+- `PA_CATALOG_SQL_SERVER_IDENTITY`: exact expected SQL `SERVERPROPERTY('ServerName')`.
+- `PA_CATALOG_SQL_DATABASE_IDENTITY`: exact expected SQL `DB_NAME()`.
+
+The source identity is established by TLS-authenticated SQL connectivity plus those exact metadata checks and existence of `dbo.proceduredata`; a Mac hostname or filename establishes nothing. Missing/mismatched identity fails closed. The private key must match the configured public authority. The source read uses an autocommit-disabled transaction: count, complete two-column SELECT to EOF, and final count under `HOLDLOCK,TABLOCK` shared table locks. These locks preserve a complete, consistent table read and can temporarily block catalog writers; run only in an authorized extraction window. The transaction is rolled back to release locks; all executed SQL statements are SELECTs. Missing rows, duplicates, invalid descriptions and unknown source identity produce no authorized artifact.
+
+Artifact schema v1 is deterministic UTF-8 JSON with sorted exact code/description entries. The catalog digest retains Phase 1's SHA-256 wire hash of sorted code/description pairs. The Ed25519 signature covers canonical compact, sorted-key JSON of the entire manifest: source authority/server/database/table/columns, millisecond UTC extraction time, schema version, digest, record count, expected/final SQL counts, completed flag, consistency method and signing-key fingerprint. Private key material and client-provided verification keys are not artifact fields. The server verifies against its own configured key; changing configuration does not silently accept old signatures.
+
+Artifact inputs are bounded to 16 MiB and 100,000 entries. Strict schema/UTF-8/duplicate-JSON-key checks, unique normalized codes, genuine canonical descriptions (no code fallback), exact row counts and full catalog digest are enforced. Canonical codes/descriptions are preserved rather than fabricated. Invalid new imports do not replace previous trusted evidence. Ingestion uses the existing 1,000-entry transaction chunks; partial `INGESTING` snapshots are never trust evidence. No new collections or indexes are needed.
+
+Maximum evidence age is **24 hours**, measured from signed extraction time. Future timestamps and age at or beyond 24 hours fail closed at ingest, independent validation, trust promotion and canonical lookup used for new mapping authorization. Existing ACTIVE mapping resolution preserves integrity checks without requiring fresh evidence. Expired snapshots/evidence remain stored for audit. This is code/description authority only: provider tariff eligibility and price applicability remain explicitly `NOT_VERIFIED`.
+
+Three authenticated routes are registered:
+
+- `POST /api/pa-catalog/snapshots`: raw JSON artifact, requires `PA_CATALOG_INGEST`.
+- `POST /api/pa-catalog/snapshots/{snapshot_id}/validate`: empty body, requires `PA_CATALOG_VALIDATE`.
+- `POST /api/pa-catalog/snapshots/{snapshot_id}/trust`: empty body, requires `PA_CATALOG_TRUST`.
+
+Permissions and actor identity come from authoritative staff records. Clients cannot nominate a public key, validator, trust actor, validation receipt or TRUSTED status. An uploaded artifact receives structural `VALIDATED` status only, not authority to activate mappings. Independent validation re-verifies signature/completeness from server-held entries and writes one immutable validation receipt bound to manifest digest/key fingerprint. Trust promotion re-verifies again and requires a trust actor distinct from both the uploader and the persisted validator. Uploader, validator and truster must be three distinct authorized staff identities, enforced in the domain and rechecked during canonical lookup. Roles cannot collapse into a single self-certifying request. Absent authority configuration produces safe 503 responses; invalid evidence/conflicts fail closed without payload/credential details.
+
+Signed manifest/signature/digest/fingerprint are retained immutably alongside the existing snapshot; validation bindings extend the existing evidence model. Append-only snapshot/validation/trust events record authenticated identities and references. Mandatory Mongo transactions cover each publication stage and rollback; no unsafe fallback or external-side-effect retry exists. Legacy unsigned snapshots cannot serve as new activation evidence merely because they contain the old extraction-method label. Real replica-set and operational extraction validation remain prerequisites before production use. Tests use ephemeral test-only keys and fake SQL/Mongo, never production credentials.
+
+
+### Phase 3B review safeguards
+
+Catalog uploader, evidence validator and catalog truster must be three distinct
+persisted staff identities. Domain validation, trust promotion and canonical
+procedure resolution enforce this rule; Cursor output supplies no authority.
+
+All three catalog mutations require strict `application/json` (optionally UTF-8).
+Validate/trust accept only `{}`. Cookie-authenticated browser requests must carry
+an exact allowed frontend Origin or the API's same Origin. Non-browser clients
+without Origin must explicitly send `X-Pharmacy-CSRF: 1`; cross-site Fetch
+Metadata is rejected on that path. Missing/null/form Content-Type and null,
+foreign or duplicate Origin cannot authorize a mutation. Authentication and
+server-record permissions remain mandatory; CORS alone supplies no protection.
+
+The 24-hour limit is exclusive: evidence aged exactly 24 hours cannot authorize
+new validation, trust, mapping validation or activation/replacement. Existing
+ACTIVE mappings may resolve against their previously trusted immutable snapshot
+after expiry. This exception requires the current active head/version and exact
+snapshot/code association, and still checks signature, source identity, complete
+content integrity, trust evidence, distinct identities and revocation. Expired
+snapshots remain available for audit and do not establish provider eligibility
+or tariff price applicability.
+
+Full bounded catalog verification is reused only within a request/calculation or
+Mongo transaction, keyed by database/session, complete snapshot and validation
+metadata, and the current configured public-key fingerprint/source authority.
+Each medication then uses the indexed `(snapshotId, normalizedCode)` lookup and
+compares its exact code/description to the verified signed entry binding. Trust,
+revocation, evidence/header changes and key rotation are rechecked each use.
+Entry changes cannot escape the signed binding; subsequent operations verify the
+whole catalog again. There is no persistent cross-request cache. Real Mongo
+replica-set transaction validation remains a production prerequisite.

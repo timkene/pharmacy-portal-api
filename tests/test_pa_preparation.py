@@ -159,19 +159,31 @@ async def catalog(db, entries=None, **overrides):
         contentHash=pa_mapping.catalog_hash(entries), evidenceReference="controlled-extraction")
     if overrides:
         evidence = CatalogEvidence.model_validate({**evidence.model_dump(), **overrides})
-    snapshot = await pa_mapping.persist_catalog_snapshot(db, ADMIN, evidence, entries)
+    from catalog_fixtures import signed_artifact
+    from core.pa_catalog_provenance import canonical_json, key_fingerprint
+    import hashlib
+    artifact = signed_artifact(entries, extracted=evidence.sourceExtractedAt)
+    provenance = {'manifest': artifact['manifest'], 'signature': artifact['signature'],
+        'manifestDigest': hashlib.sha256(canonical_json(artifact['manifest'])).hexdigest(),
+        'signingKeyFingerprint': artifact['manifest']['signingKeyFingerprint']}
+    uploader = Actor(actorId="catalog-upload-test", canIngestCatalog=True)
+    snapshot = await pa_mapping.persist_catalog_snapshot(db, uploader, evidence, entries, signed_provenance=provenance)
     if snapshot["status"] == "VALIDATED":
         # Clearly privileged fixture: simulates server-controlled extraction validator.
         validation = CatalogValidationEvidence(**evidence.model_dump(), snapshotId=snapshot["_id"],
             validationMethod="SERVER_CONTROLLED_MEDICLOUD_EXTRACTION", validatedAt=NOW,
-            validatedBy=ADMIN.actorId, validationEvidenceId=str(ObjectId()))
+            validatedBy=ADMIN.actorId, validationEvidenceId=str(ObjectId()),
+            manifestDigest=provenance['manifestDigest'], signingKeyFingerprint=provenance['signingKeyFingerprint'])
         ref = await pa_mapping.register_catalog_validation(db, ADMIN, validation)
-        snapshot = await pa_mapping.promote_catalog_trust(db, ADMIN, snapshot["_id"], ref)
+        trustee = Actor(actorId="independent-catalog-trust-test", canTrustCatalog=True)
+        snapshot = await pa_mapping.promote_catalog_trust(db, trustee, snapshot["_id"], ref)
     return snapshot
 
 
 @pytest_asyncio.fixture
-async def flow(monkeypatch):
+async def flow(monkeypatch, tmp_path):
+    from catalog_fixtures import configure
+    configure(monkeypatch, tmp_path)
     from api import pa
     forbidden = AsyncMock(side_effect=AssertionError("IssuePa forbidden during preparation"))
     monkeypatch.setattr(pa_client, "issue_pa", forbidden)

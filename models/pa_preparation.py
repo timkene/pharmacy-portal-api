@@ -110,6 +110,8 @@ class CatalogValidationEvidence(CatalogEvidence):
     validatedAt: datetime
     validatedBy: str = Field(min_length=1)
     validationEvidenceId: str = Field(min_length=1)
+    manifestDigest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    signingKeyFingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @field_validator("validatedAt")
     @classmethod

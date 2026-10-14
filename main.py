@@ -1,9 +1,10 @@
+from core.security import STAFF_BROWSER_ORIGINS
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from api import aggregator, auth, orders, pa, pa_preparation, pa_mapping_review, search
+from api import aggregator, auth, orders, pa, pa_preparation, pa_mapping_review, pa_catalog, search
 from core.database import close_db, connect_db
 from core.security import validate_session_secret
 
@@ -20,11 +21,7 @@ app = FastAPI(title="Pharmacy Dispatch API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://pharmacy-portal-delta.vercel.app",
-        "https://cil-frontend.vercel.app",
-    ],
+    allow_origins=list(STAFF_BROWSER_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,6 +32,7 @@ app.include_router(orders.router, prefix="/api")
 app.include_router(pa.router, prefix="/api")
 app.include_router(pa_preparation.router, prefix="/api")
 app.include_router(pa_mapping_review.router, prefix="/api")
+app.include_router(pa_catalog.router, prefix="/api")
 app.include_router(aggregator.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 

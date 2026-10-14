@@ -150,6 +150,12 @@ def price_evidence(order):
 
 
 async def calculate(db, order, aggregator, evidence, session, now, catalog_snapshot_id=None):
+    from core.pa_catalog_provenance import catalog_verification_scope
+    async with catalog_verification_scope():
+        return await _calculate(db, order, aggregator, evidence, session, now, catalog_snapshot_id)
+
+
+async def _calculate(db, order, aggregator, evidence, session, now, catalog_snapshot_id=None):
     """Pure with respect to orders/ledger; only reads mapping/catalog collections."""
     amounts, price_source, prices_valid = price_evidence(order)
     meds = order.get("medications") or []
@@ -230,7 +236,8 @@ async def calculate(db, order, aggregator, evidence, session, now, catalog_snaps
                 review.append("SOURCE_DESCRIPTION_CHANGED")
             else:
                 try:
-                    entry = await canonical_procedure(db, mapping["snapshotId"], mapping["medicloudCode"], session)
+                    entry = await canonical_procedure(db, mapping["snapshotId"], mapping["medicloudCode"], session,
+                        existing_mapping=(mapping["mappingId"], mapping["version"]))
                     if (entry["procedureCode"] != mapping["medicloudCode"]
                             or entry["procedureDescription"] != mapping["medicloudDescription"]):
                         raise DomainConflict("CATALOG_EVIDENCE_MISMATCH")
@@ -299,7 +306,7 @@ async def calculate(db, order, aggregator, evidence, session, now, catalog_snaps
             blocked.append("DELIVERY_PRICE_INVALID")
         entry = None
         try:
-            entry = await canonical_procedure(db, delivery_snapshot, "PRE11", session)
+            entry = await canonical_procedure(db, delivery_snapshot, "PRE11", session, reserved_delivery=True)
         except DomainConflict:
             blocked.append("DELIVERY_CATALOG_EVIDENCE_REQUIRED")
         delivery.update(orderLineId="delivery-PRE11", sourceNamespaceId="SYSTEM_DELIVERY",

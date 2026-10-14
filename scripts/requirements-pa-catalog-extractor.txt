@@ -1,0 +1,3 @@
+# Offline workstation only; backend uses requirements.txt and never imports pyodbc.
+-r ../requirements.txt
+pyodbc>=5.0.0
