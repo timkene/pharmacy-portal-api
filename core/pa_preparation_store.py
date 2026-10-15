@@ -19,11 +19,14 @@ COLLECTIONS = (
     "pa_procedure_catalog_entries", "pa_preparation_events",
     "pa_catalog_validation_evidence", "pa_preparation_contexts",
     "pa_mapping_review_exports", "pa_mapping_review_imports",
+    "pa_mapping_proposal_decisions", "pa_mapping_activations",
 )
 
 
 async def ensure_preparation_indexes(db):
     indexes = {
+        "pa_mapping_proposal_decisions": [([("proposalId", 1)], {"unique": True})],
+        "pa_mapping_activations": [([("proposalId", 1)], {"unique": True})],
         "pa_mapping_review_exports": [([("batchId", 1), ("createdAt", -1)], {}), ([("expiresAt", 1)], {})],
         "pa_mapping_review_imports": [([("importId", 1)], {"unique": True})],
         "pa_preparation_contexts": [([("batchId", 1)], {})],
@@ -39,7 +42,7 @@ async def ensure_preparation_indexes(db):
             ([("orderId", 1), ("isCurrent", 1)], {}),
             ([("mappingId", 1), ("isCurrent", 1)], {}),
         ],
-        "pa_mapping_versions": [([("mappingId", 1), ("version", 1)], {"unique": True}),
+        "pa_mapping_versions": [([("provenance", 1), ("status", 1), ("_id", 1)], {}),([("mappingId", 1), ("version", 1)], {"unique": True}),
             ([("sourceNamespaceId", 1), ("sourceIdentityType", 1), ("sourceIdentityKey", 1), ("version", 1)], {"unique": True})],
         "pa_mapping_heads": [([("sourceNamespaceId", 1), ("sourceIdentityType", 1), ("sourceIdentityKey", 1)], {"unique": True})],
         "pa_procedure_catalog_snapshots": [([("status", 1), ("sourceExtractedAt", -1)], {})],

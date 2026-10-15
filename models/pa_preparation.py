@@ -35,6 +35,8 @@ class Actor(StrictModel):
     canValidateCatalog: bool = Field(default=False, strict=True)
     canTrustCatalog: bool = Field(default=False, strict=True)
     canReviewMappings: bool = Field(default=False, strict=True)
+    canApproveMappings: bool = Field(default=False, strict=True)
+    canActivateMappings: bool = Field(default=False, strict=True)
 
 
 class MappingIdentity(StrictModel):

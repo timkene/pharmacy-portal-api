@@ -479,3 +479,95 @@ revocation, evidence/header changes and key rotation are rechecked each use.
 Entry changes cannot escape the signed binding; subsequent operations verify the
 whole catalog again. There is no persistent cross-request cache. Real Mongo
 replica-set transaction validation remains a production prerequisite.
+
+
+### Phase 3C — explicit proposal decisions and controlled activation
+
+Five authenticated routes are added, with independent authoritative staff-record
+permissions. Import/export permissions grant none of these capabilities:
+
+- `GET /api/pa-mapping-proposals`: `PA_MAPPING_REVIEW`; UUID `after` cursor,
+  `limit` 1–50 (default 25), minimized items and nextCursor.
+- `GET /api/pa-mapping-proposals/{proposal_id}`: `PA_MAPPING_REVIEW`.
+- `POST /api/pa-mapping-proposals/{proposal_id}/reject`: `PA_MAPPING_REVIEW`.
+- `POST /api/pa-mapping-proposals/{proposal_id}/approve`: `PA_MAPPING_APPROVE`.
+- `POST /api/pa-mapping-proposals/{proposal_id}/activate`: `PA_MAPPING_ACTIVATE`.
+
+Mutations use existing signed staff sessions and strict JSON/Origin/CSRF checks
+from catalog administration. Bodies are capped at 4 KiB and forbid extra fields.
+Every action requires `requestId` (UUID), `expectedHeadVersion`, explicitly nullable
+`expectedActiveVersion`, and a bounded nonblank `reason`. Activation additionally
+accepts `replaceActive` (default false); replacing an active head requires true
+and its exact expected version. No request accepts actor, permissions, snapshot,
+canonical description or verification evidence. Mutation permissions grant their
+own minimized result, not standalone review reads. Importers cannot approve or
+activate their own proposals even if granted those permissions. Importer, approver
+and activator must be three distinct authenticated staff identities. A staff member
+holding both APPROVE and ACTIVATE cannot activate their own approval. Activation
+rechecks the persisted import receipt, original proposal, approval decision and
+approved revision identities, including on idempotent receipt replay. Missing,
+malformed or inconsistent identities fail closed.
+
+Original Phase 3A PROPOSED documents remain immutable. Decisions append a
+VALIDATED or REJECTED mapping version and an immutable decision receipt, without
+changing the active head. The team-facing workflow states are PROPOSED →
+APPROVED or REJECTED; APPROVED → ACTIVE. An activated proposal later displaced
+by another head is shown as REPLACED. APPROVED is a decision state; VALIDATED is
+its catalog-bound version evidence. Generic domain state updates cannot bypass
+this workflow for imported Cursor proposals. Explicit retirement of an ACTIVE
+mapping remains a separate existing internal domain operation.
+
+Approval chooses the latest server-held TRUSTED snapshot. A newest snapshot that
+is invalid, revoked or expired fails closed; there is no fallback to weaker
+catalog evidence. Code must exactly match its canonical code, and a supplied
+suggested description must exactly match the genuine canonical description.
+Absent suggested descriptions use only catalog descriptions, never code fallback.
+Activation re-verifies the exact approved snapshot, canonical entry and approval
+revision. Both require signed, complete, unrevoked evidence younger than 24 hours
+and three distinct catalog provenance identities. Existing active and reserved
+PRE11 resolution retain Phase 3B's integrity-preserving expiry policy. PRE11 may
+never be imported, approved or activated as an ordinary medication mapping.
+Catalog verification conveys no tariff, coverage or price eligibility.
+
+Server-held imported manifests bind every source row, namespace/type/key,
+code/description, original mapping head, preparation revision and fingerprint.
+Approval and activation require current active batch ownership, current source
+order/assignment/pricing state and nonsuperseded proposal revisions. They require
+an OPEN/AUDITING source batch; closed/stale contexts require a fresh
+preparation/export/import cycle. Rejection requires the original immutable proposal,
+namespace/source identity, manifest integrity and import provenance, but may close
+out a pending proposal after its batch closes or its source/revision/head changes.
+Rejection does not write the mapping head or check catalog freshness, since it
+grants no authority. Rejected historical revisions cannot supersede a different
+pending proposal or approval. Existing APPROVED/ACTIVE/REJECTED decisions cannot
+be reversed by rejection; only the same completed rejection may be replayed.
+Export expiry governs the original transfer; a committed proposal may be approved
+or activated later provided its immutable manifest and
+current source bindings remain valid and catalog evidence is fresh.
+
+`pa_mapping_proposal_decisions` and `pa_mapping_activations` store one immutable
+receipt per original proposal, with unique proposal indexes. Existing immutable
+mapping-version indexes serialize new proposals/decisions for each namespace
+identity. Approval/rejection allocate versions without moving heads. Activation
+allocates an ACTIVE version and compare-and-swaps the unique namespace head
+inside one mandatory Mongo transaction, together with the activation receipt,
+source-bound preparation stale markers and audit event. Existing ACTIVE history
+is retained. No nontransactional fallback or automatic retry exists. Exact repeats
+by the same actor/request/content return the committed receipt; differing repeats
+conflict. Historical receipt replay performs no new authorization or activation.
+
+Review pages share one bounded transaction/catalog verification scope. Snapshots
+are fully verified once per scope and entries use signed-bound indexed lookups.
+Audit events retain actor, timestamp, request correlation, mapping versions,
+reason and catalog reference without raw files/member/PA evidence. Activation
+only invalidates preparation metadata; explicit later recalculation consumes the
+new head. It neither recalculates nor rewrites order prices, quantities, delivery
+fees, PA transmission ledger or PA reference ownership, and has no IssuePa path.
+
+Operational prerequisites remain configured public authority, fresh trusted
+catalog and transaction-capable Mongo with required indexes. Real replica-set
+concurrency/transaction validation remains required before production; fake
+transaction tests are not a substitute. Source reads are snapshot-consistent
+within the operation, not a guarantee against later order changes. Submission
+must independently apply all existing drift/reconciliation safeguards. No live
+MediCloud, Mac runtime, frontend, tariff comparison or deployment is introduced.

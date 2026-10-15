@@ -244,6 +244,8 @@ async def revise_mapping(db, actor, mapping_id, expected_version, status, *, sna
             {"mappingId": mapping_id, "version": expected_version}, session=session)
         if not previous:
             raise DomainConflict("PREVIOUS_MAPPING_VERSION_MISSING")
+        if previous.get("provenance") == "CURSOR_PROPOSAL" and status != "RETIRED":
+            raise DomainConflict("EXPLICIT_PROPOSAL_WORKFLOW_REQUIRED")
         if status == "REJECTED" and previous["status"] not in {"PROPOSED", "VALIDATED"}:
             raise DomainConflict("ACTIVE_MAPPING_REQUIRES_RETIREMENT_OR_REPLACEMENT")
         if status in {"PROPOSED", "VALIDATED"} and previous["status"] == "ACTIVE" and not replacement:
