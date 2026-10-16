@@ -44,7 +44,7 @@ async def test_explicit_workflow_immutable_evidence_minimized_and_prices_unchang
         await domain.activate(flow.db,ACTIVATOR,row['_id'],action(flow,activate=True))
     listing=await domain.list_proposals(flow.db,REVIEWER,25)
     assert len(listing['items'])==1 and listing['items'][0]['workflowStatus']=='PROPOSED'
-    assert listing['items'][0]['catalogVerification']=='VERIFIED'
+    assert listing['items'][0]['catalogVerification']=='NOT_EVALUATED'
     approve=action(flow)
     result=await domain.decide(flow.db,APPROVER,row['_id'],approve,approve=True)
     assert result['status']=='APPROVED' and flow.db.pa_mapping_heads.rows[0]['activeVersion'] is None
@@ -304,9 +304,9 @@ async def test_catalog_page_verification_reused_and_cursor_bounded(flow,monkeypa
         flow.db.pa_mapping_versions.rows.append({**deepcopy(row),'_id':str(uuid4())})
     spy=AsyncMock(wraps=provenance.verify_snapshot); monkeypatch.setattr(provenance,'verify_snapshot',spy)
     first=await domain.list_proposals(flow.db,REVIEWER,2)
-    assert len(first['items'])==2 and first['nextCursor'] and spy.await_count==1
+    assert len(first['items'])==2 and first['nextCursor'] and spy.await_count==0
     second=await domain.list_proposals(flow.db,REVIEWER,2,first['nextCursor'])
-    assert len(second['items'])==2 and second['nextCursor'] is None and spy.await_count==2
+    assert len(second['items'])==2 and second['nextCursor'] is None and spy.await_count==0
     assert not ({r['proposalId'] for r in first['items']} & {r['proposalId'] for r in second['items']})
 
 

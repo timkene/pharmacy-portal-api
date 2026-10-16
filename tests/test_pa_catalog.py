@@ -269,7 +269,9 @@ def test_api_missing_authority_503(team,monkeypatch):
 
 
 def test_only_catalog_routes():
-    assert len(api.router.routes)==3
+    assert len(api.router.routes)==5
+    assert sum('POST' in route.methods for route in api.router.routes)==3
+    assert sum('GET' in route.methods for route in api.router.routes)==2
     assert all('mapping' not in route.path and 'submission' not in route.path for route in api.router.routes)
 
 

@@ -31,6 +31,7 @@ class Actor(StrictModel):
     canExportMappings: bool = Field(default=False, strict=True)
     canImportMappings: bool = Field(default=False, strict=True)
     canProposeMappings: bool = Field(default=False, strict=True)
+    canReadCatalog: bool = Field(default=False, strict=True)
     canIngestCatalog: bool = Field(default=False, strict=True)
     canValidateCatalog: bool = Field(default=False, strict=True)
     canTrustCatalog: bool = Field(default=False, strict=True)

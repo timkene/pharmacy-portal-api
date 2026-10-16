@@ -1,5 +1,6 @@
 """Staff identity contract, using synthetic sessions and no live integrations."""
 from types import SimpleNamespace
+from bson import ObjectId
 from unittest.mock import AsyncMock
 
 import pytest
@@ -9,7 +10,7 @@ from api import auth, aggregator
 from core import security
 
 
-IDENTITY = {"userId": "synthetic-staff", "name": "Test Staff", "email": "staff@example.com"}
+IDENTITY = {"userId": "123456789012345678901234", "name": "Test Staff", "email": "staff@example.com"}
 
 
 @pytest.fixture
@@ -20,10 +21,8 @@ def client(monkeypatch):
     monkeypatch.setattr(main, "connect_db", AsyncMock())
     monkeypatch.setattr(main, "close_db", AsyncMock())
 
-    def forbidden_db():
-        raise AssertionError("Identity must not access the database")
-
-    monkeypatch.setattr(auth, "get_db", forbidden_db)
+    lookup=AsyncMock(return_value={'_id':ObjectId(IDENTITY['userId']), 'permissions':[]})
+    monkeypatch.setattr(auth, "get_db", lambda: SimpleNamespace(staff_users=SimpleNamespace(find_one=lookup)))
     with TestClient(main.app, base_url="https://testserver") as client:
         yield client
 
@@ -33,7 +32,7 @@ def test_staff_identity_minimum_response(client):
     client.cookies.set("staff_session", token)
     response = client.get("/api/auth/staff/me")
     assert response.status_code == 200
-    assert response.json() == IDENTITY
+    assert response.json() == {**IDENTITY, "permissions": []}
     assert token not in response.text
     assert token.split(".")[1] not in response.text
     assert security.validate_session_secret() not in response.text
@@ -79,8 +78,9 @@ def test_staff_login_to_identity(client, monkeypatch):
     login = client.post("/api/auth/staff/login", json={"email": user["email"], "password": "synthetic-password"})
     assert login.status_code == 200
     assert security.decode_session(login.json()["session"], "staff")["userId"] == IDENTITY["userId"]
-    assert client.get("/api/auth/staff/me").json() == IDENTITY
-    lookup.assert_awaited_once_with({"email": user["email"]})
+    assert client.get("/api/auth/staff/me").json() == {**IDENTITY, "permissions": []}
+    assert lookup.await_count == 2
+    lookup.assert_awaited_with({"_id": ObjectId(IDENTITY["userId"])})
 
 
 def test_aggregator_auth_unchanged(client):

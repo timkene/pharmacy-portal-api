@@ -2,7 +2,7 @@
 import json
 from uuid import UUID
 from core.security import STAFF_BROWSER_ORIGINS
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from api.pa_preparation import SafePreparationRoute, staff_context
 from core.database import get_db
 from core import pa_catalog as domain, pa_mapping
@@ -11,6 +11,7 @@ from core.pa_preparation_store import DomainConflict
 from models.pa_catalog import MAX_ARTIFACT_BYTES
 from models.pa_preparation import Actor
 
+READ = 'PA_CATALOG_READ'
 INGEST = 'PA_CATALOG_INGEST'
 VALIDATE = 'PA_CATALOG_VALIDATE'
 TRUST = 'PA_CATALOG_TRUST'
@@ -47,8 +48,8 @@ async def empty_json(request):
 def require(permission):
     async def dependency(request: Request, context=Depends(staff_context)):
         if permission not in context['permissions']: raise HTTPException(403, 'Catalog permission required')
-        mutation_security(request)
-        return Actor(actorId=context['actorId'], canIngestCatalog=permission == INGEST,
+        if request.method == 'POST': mutation_security(request)
+        return Actor(actorId=context['actorId'], canReadCatalog=permission == READ, canIngestCatalog=permission == INGEST,
             canValidateCatalog=permission == VALIDATE, canTrustCatalog=permission == TRUST)
     return dependency
 
@@ -90,3 +91,14 @@ async def trust(snapshot_id: UUID, request: Request, actor=Depends(require(TRUST
     # One server-selected validation receipt per snapshot; callers cannot nominate authority.
     snapshot = await safe(pa_mapping.promote_catalog_trust(db, actor, str(snapshot_id), str(snapshot_id)))
     return domain.snapshot_view(snapshot)
+
+
+@router.get('/snapshots')
+async def snapshots(limit: int = Query(default=25, ge=1, le=50), cursor: UUID | None = None,
+                    actor=Depends(require(READ)), db=Depends(get_db)):
+    return await safe(domain.list_snapshots(db, actor, limit, str(cursor) if cursor else None))
+
+
+@router.get('/snapshots/{snapshot_id}')
+async def snapshot(snapshot_id: UUID, actor=Depends(require(READ)), db=Depends(get_db)):
+    return await safe(domain.read_snapshot(db, actor, str(snapshot_id)))

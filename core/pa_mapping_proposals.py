@@ -230,22 +230,73 @@ async def detail(db,actor,proposal_id):
         return await _detail(db,proposal_id,session)
 
 
-async def _detail(db,proposal_id,session):
+async def _detail(db,proposal_id,session,*,verify_catalog=True):
     row=await proposal(db,proposal_id,session)
     decision=await db.pa_mapping_proposal_decisions.find_one({'_id':proposal_id},session=session)
     activation=await db.pa_mapping_activations.find_one({'_id':proposal_id},session=session)
     head=await head_for(db,row,session)
-    state='PROPOSED' if not decision else decision['status']
-    if activation: state='ACTIVE' if head.get('activeVersion')==activation['lifecycleVersion'] else 'REPLACED'
-    verification='NOT_VERIFIED'; code=description=None
-    try:
-        _,entry=await catalog_entry(db,row,session)
-        verification='VERIFIED'; code=entry['procedureCode']; description=entry['procedureDescription']
-    except DomainConflict: verification='UNAVAILABLE_OR_INVALID'
+    recorded_state=decision.get('status') if decision else 'PROPOSED'
+    if recorded_state not in ('PROPOSED','APPROVED','REJECTED'): recorded_state='UNKNOWN'
+    if activation:
+        version=activation.get('lifecycleVersion')
+        recorded_state=('ACTIVE' if head.get('activeVersion')==version else 'REPLACED') if type(version) is int and version>0 else 'UNKNOWN'
+    active_head=await db.pa_mapping_versions.find_one({'mappingId':row['mappingId'],
+        'version':head['activeVersion']},session=session) if type(head.get('activeVersion')) is int and head['activeVersion']>0 else None
+    from core.pa_read_views import catalog_metadata, proposal_actors
+    actors=await proposal_actors(db,row,decision,activation,session,active_head=active_head)
+    approval_bound=bool(activation) or bool(decision and (decision.get('status')=='APPROVED' or decision.get('snapshotId') is not None))
+    if approval_bound:
+        identity=decision.get('snapshotId') if decision else None
+    else:
+        snapshots=await db.pa_procedure_catalog_snapshots.find({'status':'TRUSTED'},session=session).sort('sourceExtractedAt',-1).limit(1).to_list(1)
+        identity=snapshots[0]['_id'] if snapshots else None
+    catalog=await catalog_metadata(db,identity,session,verify=verify_catalog)
+    catalog['binding']='APPROVAL_BOUND' if approval_bound else 'LATEST_TRUSTED'
+    scope='FULL_VERIFICATION' if verify_catalog else 'METADATA_ONLY'
+    catalog['verificationScope']=scope
+    if not verify_catalog:
+        # Stored status is historical metadata, never a verified trust declaration.
+        catalog['recordedStatus']=catalog['status']
+        catalog['status']='NOT_EVALUATED'
+    verification='UNAVAILABLE_OR_INVALID' if verify_catalog else 'NOT_EVALUATED'
+    purpose='UNAVAILABLE' if verify_catalog else 'METADATA_ONLY'
+    code=description=None
+    actor_valid=actors['threePersonStatus']!='INVALID' and recorded_state!='UNKNOWN'
+    if verify_catalog and actor_valid:
+        try:
+            if recorded_state=='ACTIVE' and catalog['usableForExistingResolution']:
+                # Only the actual ACTIVE head may use the non-fresh resolution policy.
+                entry=await mappings.canonical_procedure(db,identity,active_head['medicloudCode'],session,
+                    existing_mapping=(row['mappingId'],head['activeVersion']))
+                if (entry['procedureCode']!=row['proposedMedicloudCode']
+                        or entry['procedureDescription']!=active_head['medicloudDescription']):
+                    raise DomainConflict('ACTIVE_MAPPING_EVIDENCE_MISMATCH')
+                verification='VERIFIED' if catalog['usableForNewAuthorization'] else 'VERIFIED_FOR_EXISTING_ACTIVE'
+                purpose='EXISTING_ACTIVE_RESOLUTION'
+                code=entry['procedureCode']; description=entry['procedureDescription']
+            elif catalog['usableForNewAuthorization']:
+                _,entry=await catalog_entry(db,row,session,identity)
+                if approval_bound and (not decision or decision.get('medicloudCode')!=entry['procedureCode']
+                        or decision.get('medicloudDescription')!=entry['procedureDescription']):
+                    raise DomainConflict('APPROVAL_EVIDENCE_MISMATCH')
+                verification='VERIFIED'; purpose='NEW_AUTHORIZATION'
+                code=entry['procedureCode']; description=entry['procedureDescription']
+        except (ValueError,TypeError,KeyError,AttributeError): pass
+    workflow_valid=actor_valid
+    if recorded_state in ('APPROVED','ACTIVE','REPLACED'):
+        workflow_valid=workflow_valid and catalog['usableForExistingResolution']
+        if recorded_state=='ACTIVE': workflow_valid=workflow_valid and purpose=='EXISTING_ACTIVE_RESOLUTION'
+        else: workflow_valid=workflow_valid and purpose=='NEW_AUTHORIZATION'
+    workflow_verification=('INVALID' if not actor_valid else 'NOT_EVALUATED' if not verify_catalog
+        else 'VERIFIED' if workflow_valid else 'INVALID')
+    state=recorded_state if workflow_valid and (verify_catalog or recorded_state in ('PROPOSED','REJECTED')) else 'UNVERIFIED'
     return {**{k:row.get(k) for k in ('mappingId','version','sourceNamespaceId','sourceIdentityType','sourceIdentityKey',
         'sourceCode','sourceDescription','proposedMedicloudCode','proposedMedicloudDescription','mappingNotes','provenance')},
-        'proposalId':proposal_id,'workflowStatus':state,'expectedHeadVersion':head['version'],
+        'proposalId':proposal_id,'workflowStatus':state,'recordedWorkflowStatus':recorded_state,
+        'workflowVerification':workflow_verification,'evidenceScope':scope,'expectedHeadVersion':head['version'],
+        **actors, 'catalog':catalog,
         'expectedActiveVersion':head.get('activeVersion'),'catalogVerification':verification,
+        'catalogVerificationPurpose':purpose,
         'canonicalCode':code,'canonicalDescription':description,'providerTariffEligibility':'NOT_VERIFIED',
         'priceApplicability':'NOT_VERIFIED'}
 
@@ -257,5 +308,5 @@ async def list_proposals(db,actor,limit,after=None):
     if after: query['_id']={'$gt':after}
     async with transaction(db) as session:
         rows=await db.pa_mapping_versions.find(query,session=session).sort('_id',1).limit(limit+1).to_list(limit+1)
-        return {'items':[await _detail(db,row['_id'],session) for row in rows[:limit]],
+        return {'items':[await _detail(db,row['_id'],session,verify_catalog=False) for row in rows[:limit]],
             'nextCursor':rows[limit-1]['_id'] if len(rows)>limit else None}

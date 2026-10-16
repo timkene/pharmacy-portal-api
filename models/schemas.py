@@ -35,6 +35,7 @@ class UserResponse(BaseModel):
 
 class StaffIdentityResponse(UserResponse):
     userId: str
+    permissions: list[str] = Field(default_factory=list)
 
 
 class AuthResponse(BaseModel):

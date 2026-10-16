@@ -11,6 +11,7 @@ from pymongo.errors import PyMongoError
 from core.database import get_db
 from core.pa_catalog_provenance import catalog_verification_scope
 from core.security import decode_session
+from core.pa_staff import staff_enabled, pa_permissions
 from core import pa_preparation as domain
 from core.pa_preparation_store import DomainConflict, now_utc
 from models.pa_preparation import Actor, MemberEvidence
@@ -43,10 +44,9 @@ async def staff_context(response: Response, staff_session: str | None = Cookie(d
     if not user or not ObjectId.is_valid(user.get("userId")):
         raise HTTPException(401, "Staff authentication required")
     record = await db.staff_users.find_one({"_id": ObjectId(user["userId"])})
-    if not record:
+    if not staff_enabled(record):
         raise HTTPException(401, "Staff authentication required")
-    permissions = record.get("permissions")
-    return {"actorId": str(record["_id"]), "permissions": permissions if isinstance(permissions, list) else []}
+    return {"actorId": str(record["_id"]), "permissions": pa_permissions(record)}
 
 
 def require(permission):

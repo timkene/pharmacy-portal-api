@@ -571,3 +571,219 @@ transaction tests are not a substitute. Source reads are snapshot-consistent
 within the operation, not a guarantee against later order changes. Submission
 must independently apply all existing drift/reconciliation safeguards. No live
 MediCloud, Mac runtime, frontend, tariff comparison or deployment is introduced.
+
+### Phase 4A — minimized frontend read contracts
+
+No frontend, export-history, submission or new mapping/catalog mutation is added.
+Existing login/session/logout formats and the three catalog POST contracts are
+unchanged. Successful GET responses remain `Cache-Control: no-store`; requests never write
+receipt, audit, catalog, order, price, PA ledger or ownership documents.
+
+**Staff identity.** `GET /api/auth/staff/me` retains `userId`, `name`, `email`
+and adds `permissions: string[]`. The name/email remain the existing signed
+session display fields. Permissions are current database values, never cookie,
+query, header or JSON claims: each request loads the matching ObjectId from
+`staff_users`. Missing staff or disabled staff returns 401. Legacy records with
+no disable flags remain eligible; if present, `disabled` must be explicitly
+false and `isActive` explicitly true. Null/nonboolean flags fail closed. These
+checks also apply to shared PA staff authorization. Login and logout behavior
+is unchanged; a session alone grants no PA capability.
+
+`permissions` is sorted and deduplicated and includes only:
+
+```text
+PA_PREPARATION_READ
+PA_PREPARATION_WRITE
+PA_MAPPING_EXPORT
+PA_MAPPING_IMPORT
+PA_MAPPING_REVIEW
+PA_MAPPING_APPROVE
+PA_MAPPING_ACTIVATE
+PA_CATALOG_READ
+PA_CATALOG_INGEST
+PA_CATALOG_VALIDATE
+PA_CATALOG_TRUST
+```
+
+Unknown entries and malformed permission lists grant nothing. No permission is
+assigned automatically. Existing frontend identity parsers can continue reading
+the original three fields; the current PHARMACY-PORTAL parser intentionally
+discards extras and will need a separate frontend change to retain permissions.
+The frontend cookie stays opaque; it must never derive capabilities by decoding it.
+
+**Catalog reads.** Two new routes require the independent `PA_CATALOG_READ`
+permission from the authoritative staff record. INGEST/VALIDATE/TRUST or mapping
+review permissions do not imply READ, and READ grants no mutation capability:
+
+- `GET /api/pa-catalog/snapshots?limit=25&cursor=<uuid>`: limit 1–50. Response
+  `{items: CatalogMetadata[], nextCursor: string|null,
+  skippedInvalidRecords: number, integrityScope: "METADATA_ONLY"}`.
+- `GET /api/pa-catalog/snapshots/{snapshot_id}`: returns `CatalogMetadata` or 404.
+
+Lists sort ascending by UUID `_id`, not extraction date. They scan at most 100
+candidate records plus one lookahead and read at most two validation receipts
+per returned snapshot. Noncanonical legacy IDs are skipped without echoing them;
+`skippedInvalidRecords` is page-scoped. A pathological run of invalid IDs may
+end traversal without a continuation; these records require separately authorized
+maintenance, never a repair through a GET. Malformed fields on canonical IDs
+return minimized invalid/unknown metadata rather than raw values or exceptions.
+
+Exact `CatalogMetadata` fields:
+
+```text
+snapshotId: string|null
+status: INGESTING|VALIDATED|TRUSTED|INVALID|MISSING
+source: MEDICLOUD_PROCEDUREDATA|null
+sourceExtractedAt, importedAt, validatedAt, trustedAt, revokedAt: UTC datetime|null
+recordCount: integer|null
+schemaVersion: 1|null
+revoked: boolean
+integrityStatus: NOT_EVALUATED|VERIFIED|INVALID|UNAVAILABLE
+trustStatus: UNTRUSTED|NOT_EVALUATED|TRUSTED|REVOKED|INVALID|UNAVAILABLE
+actors: {uploader: ActorStep, validator: ActorStep, truster: ActorStep}
+freshness: {
+  evaluatedAt: UTC datetime,
+  expiresAt: UTC datetime|null,
+  maximumAgeHours: 24,
+  state: FRESH|EXPIRED|FUTURE|UNKNOWN
+}
+usableForNewAuthorization: boolean
+usableForExistingResolution: boolean
+providerTariffEligibility: NOT_VERIFIED
+coverageEligibility: NOT_VERIFIED
+priceApplicability: NOT_VERIFIED
+```
+
+`ActorStep` is exactly `{state: PENDING|COMPLETED|INVALID,
+staffId: string|null, at: UTC datetime|null}`. Only bounded identifier strings and
+aware timestamps are returned. Staff email, phone, profile records and arbitrary
+stored actor payloads are not exposed. Catalog receipt ambiguity, missing actor
+evidence or non-distinct catalog identities prevents verified trust.
+
+List metadata does **not** read/hash complete catalogs. It reports
+`NOT_EVALUATED` integrity and conservative false usability flags; a stored
+TRUSTED status is not presented as verified trust. Detail and proposal views
+verify the complete bounded catalog against the configured Ed25519 authority,
+signed provenance, exact stored contents and immutable validation bindings.
+Missing configuration is represented as UNAVAILABLE, not invented trust.
+Tampered/malformed evidence is INVALID and cannot be shown usable. Snapshot or
+validation-receipt revocation is displayed independently and prevents usability.
+Full verification is reused within the existing request/transaction scope;
+there is no persistent unverified cache or live SQL fallback.
+
+Freshness uses server time and signed extraction time; exactly 24 hours is
+EXPIRED. `usableForNewAuthorization` requires VERIFIED integrity, TRUSTED status,
+nonrevocation and FRESH evidence. `usableForExistingResolution` retains the same
+integrity/trust/nonrevocation checks without requiring age below 24 hours.
+These flags describe **catalog evidence only**: they confer no staff permission,
+source eligibility, mapping approval, activation, PA submission or retry right.
+Existing ACTIVE mappings still require the actual active head/version; the
+reserved PRE11 exception remains restricted to that exact delivery contract.
+Expired evidence never authorizes new mapping approval/activation or catalog
+validation/trust. Catalog validity does not establish provider tariff eligibility,
+coverage or price authorization.
+
+**Proposal reads.** Existing `GET /api/pa-mapping-proposals` and
+`GET /api/pa-mapping-proposals/{proposal_id}` retain all existing fields and
+`PA_MAPPING_REVIEW` authorization. Each item additionally returns:
+
+```text
+actors: {importer: ActorStep, approver: ActorStep, activator: ActorStep}
+decision: ActorStep & {outcome: APPROVED|REJECTED|null}
+threePersonStatus: PENDING|VALID|INVALID
+catalog: CatalogMetadata & {binding: APPROVAL_BOUND|LATEST_TRUSTED}
+```
+
+Importer evidence comes from the committed import receipt matched to the
+original immutable proposal. Decision/activation actors and timestamps come from
+their receipts and corresponding immutable lifecycle revisions, not the current
+viewer or request fields. Rejection is a completed decision; it does not pretend
+approval or activation happened. Pending steps remain PENDING, corrupted or
+missing expected receipt evidence is INVALID, and a completed three-person chain
+must contain three distinct IDs. No raw audit/manifest/digest is returned.
+
+An existing approval always selects its stored snapshot, even when missing,
+expired, revoked or corrupt; an activation also forces approval-bound selection.
+A malformed approval does not authorize substitution of the latest catalog.
+Only undecided/rejected proposal display uses LATEST_TRUSTED, selected server-side.
+The `catalogVerification` field distinguishes fresh new-authorization checks
+(VERIFIED) from signed existing-ACTIVE resolution after expiry
+(VERIFIED_FOR_EXISTING_ACTIVE). Metadata-only proposal lists report NOT_EVALUATED
+and null canonical fields. Other unavailable/invalid checks report
+UNAVAILABLE_OR_INVALID. The nested catalog freshness, resolution flags and explicit
+verification purpose explain why an existing ACTIVE mapping can remain usable
+after the new-authorization age limit. Reads do not grant
+an action; every mutation independently repeats its existing authorization,
+three-person, concurrency, source and freshness checks.
+
+**Errors and boundaries.** Missing/invalid/expired/wrong-role sessions, missing
+staff and disabled/invalid staff flags: 401. Missing route permission: 403.
+Unknown catalog UUID: 404 with `detail: "CATALOG_NOT_FOUND"`.
+Invalid path UUID/cursor or page bounds: sanitized 422. Mongo storage errors:
+sanitized 503 (`Preparation storage unavailable`), or `Staff identity unavailable`
+for identity reads. Domain conflicts retain safe 409 reason codes; malformed
+catalog read request/domain inputs return safe 400 through the existing catalog
+error adapter. Bad stored catalog evidence is normally a 200 minimized status
+projection, not a raw exception or successful trust declaration. No keys, SQL
+identity/configuration, raw provenance, fingerprints, credentials, member PHI or
+internal audit documents appear in these responses. Real replica-set transaction
+validation remains an operational prerequisite before production rollout.
+
+
+### Phase 4A targeted review — projection scope and workflow integrity
+
+Proposal LIST (`GET /api/pa-mapping-proposals`) is now bounded **metadata only**.
+It preserves READ permission, pagination, actor minimization and the exact
+approval-bound snapshot ID, and performs zero full catalog verification or
+procedure-entry reads, including a page of 50 different catalogs. Catalog detail
+and proposal DETAIL retain full signed-content verification. No mutation contract,
+staff identity behavior or catalog read permission changes in this fix round.
+
+Proposal list/detail add these explicit read fields:
+
+```text
+evidenceScope: METADATA_ONLY|FULL_VERIFICATION
+recordedWorkflowStatus: PROPOSED|APPROVED|REJECTED|ACTIVE|REPLACED|UNKNOWN
+workflowStatus: PROPOSED|APPROVED|REJECTED|ACTIVE|REPLACED|UNVERIFIED
+workflowVerification: NOT_EVALUATED|VERIFIED|INVALID
+catalogVerification: NOT_EVALUATED|VERIFIED|VERIFIED_FOR_EXISTING_ACTIVE|UNAVAILABLE_OR_INVALID
+catalogVerificationPurpose: METADATA_ONLY|NEW_AUTHORIZATION|EXISTING_ACTIVE_RESOLUTION|UNAVAILABLE
+catalog.verificationScope: METADATA_ONLY|FULL_VERIFICATION
+```
+
+For proposal LIST only, `catalog.status` is NOT_EVALUATED and the prior stored
+value is preserved explicitly as `catalog.recordedStatus`. Integrity/trust are
+not presented as verified and usability flags remain false. Canonical code and
+description are null. List rows with recorded APPROVED/ACTIVE/REPLACED state
+show workflowStatus UNVERIFIED and workflowVerification NOT_EVALUATED unless
+actor/receipt corruption is already detected, in which case verification is
+INVALID. Open detail to evaluate evidence; recorded metadata never authorizes
+an action. Existing catalog snapshot LIST semantics are unchanged.
+
+For DETAIL, an actual current ACTIVE head may resolve its exact catalog code
+using the existing signed, trusted, unrevoked resolution policy without the
+new-authorization age requirement. At exactly 24 hours and later, valid evidence
+returns catalogVerification VERIFIED_FOR_EXISTING_ACTIVE, purpose
+EXISTING_ACTIVE_RESOLUTION and genuine canonical display fields. Fresh existing
+ACTIVE resolution retains VERIFIED with the same explicit purpose. The catalog
+continues to report usableForNewAuthorization=false after expiry; approval,
+activation/replacement, validation and trust freshness rules are unchanged.
+This exception is not available to arbitrary unmapped codes. PRE11 remains the
+separate exact reserved-delivery resolution contract, never an ordinary proposal.
+
+Workflow presentation checks immutable import/decision/activation receipts and
+corresponding lifecycle revisions, source identity/code/description bindings,
+actor IDs and timestamps, and three-person separation. Missing expected receipts,
+malformed decision fields, mismatched actors, invalid lifecycle revisions or
+inconsistent canonical evidence cannot produce an unqualified APPROVED/ACTIVE
+presentation. They return workflowStatus UNVERIFIED and verification INVALID;
+recordedWorkflowStatus retains only an allowlisted historical label, never raw
+malformed stored content. Reads never repair or rewrite immutable history.
+
+VERIFIED workflow presentation requires the appropriate signed catalog display
+check as well as consistent receipts. An expired pending approval cannot be
+shown as currently verified for a new action; its recorded approval remains
+visible separately. Existing ACTIVE resolution is explicitly distinguished from
+new authorization. None of these display fields replaces mutation-time source,
+permission, concurrency, freshness or reconciliation checks, nor establishes
+provider tariff, coverage or price eligibility. No IssuePa call path is added.

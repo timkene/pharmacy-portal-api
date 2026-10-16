@@ -1,4 +1,7 @@
 from fastapi import APIRouter, Cookie, HTTPException, Response
+from bson import ObjectId
+from pymongo.errors import PyMongoError
+from core.pa_staff import staff_enabled, pa_permissions
 
 from core.database import get_db
 from core.security import (
@@ -30,7 +33,16 @@ async def staff_me(response: Response, staff_session: str | None = Cookie(defaul
     ):
         raise HTTPException(status_code=401, detail="Invalid staff session")
     response.headers["Cache-Control"] = "no-store"
-    return StaffIdentityResponse(userId=user["userId"], name=user["name"], email=user["email"])
+    if not ObjectId.is_valid(user['userId']):
+        raise HTTPException(401, 'Invalid staff session')
+    try:
+        record = await get_db().staff_users.find_one({'_id': ObjectId(user['userId'])})
+    except (PyMongoError, RuntimeError):
+        raise HTTPException(503, 'Staff identity unavailable') from None
+    if not staff_enabled(record):
+        raise HTTPException(401, 'Staff authentication required')
+    return StaffIdentityResponse(userId=user["userId"], name=user["name"], email=user["email"],
+                                 permissions=pa_permissions(record))
 
 
 # ---------------------------------------------------------------------------
