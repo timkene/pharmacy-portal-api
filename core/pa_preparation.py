@@ -13,6 +13,9 @@ from core.pa_client import dependant_number, member_flag, _DEPENDANT_NUMBER_ALIA
 from core.pa_mapping import DomainConflict, canonical_procedure, normalized_code, require_permission
 from core.pa_preparation_store import event, now_utc, transaction
 from core.pricing import money, price_lines, subtotal
+from core.pa_catalog_provenance import CatalogConfigurationError
+from core.pa_source_namespaces import (MEDICLOUD_NAMESPACE, VERIFIED_MAPPING_SOURCE, VERIFIED_METHOD,
+    is_reserved_namespace)
 from models.pa_preparation import BatchRecord, MemberEvidence, PreparationLineEvidence, MEMBER_EVIDENCE_MAX_AGE
 
 
@@ -149,6 +152,34 @@ def price_evidence(order):
         return {}, source, False
 
 
+async def verified_source_resolution(db, med, source_code, description, blocked, session):
+    """Resolve an exact, intake-verified MediCloud code directly against its trusted snapshot.
+
+    Returns mapping-shaped evidence or None after appending a blocking reason. Only the
+    catalog binding is resolved here; member, price, provider, ledger and every other
+    readiness check still apply to the line.
+    """
+    verification = med.get("sourceVerification")
+    if (not isinstance(verification, dict) or verification.get("method") != VERIFIED_METHOD
+            or not isinstance(source_code, str) or med.get("procedureCode") != source_code
+            or verification.get("catalogCode") != source_code
+            or verification.get("catalogDescription") != description
+            or not isinstance(verification.get("snapshotId"), str)):
+        blocked.append("SOURCE_VERIFICATION_INVALID")
+        return None
+    try:
+        entry = await canonical_procedure(db, verification["snapshotId"], source_code, session,
+            verified_source={"snapshotId": verification["snapshotId"], "code": source_code})
+        if entry["procedureCode"] != source_code or entry["procedureDescription"] != description:
+            raise DomainConflict("CATALOG_EVIDENCE_MISMATCH")
+    except (DomainConflict, CatalogConfigurationError):
+        blocked.append("MAPPING_CATALOG_EVIDENCE_INVALID")
+        return None
+    return {"mappingId": None, "version": None, "mappingSource": VERIFIED_MAPPING_SOURCE,
+            "candidateConfidence": None, "snapshotId": verification["snapshotId"],
+            "medicloudCode": entry["procedureCode"], "medicloudDescription": entry["procedureDescription"]}
+
+
 async def calculate(db, order, aggregator, evidence, session, now, catalog_snapshot_id=None):
     from core.pa_catalog_provenance import catalog_verification_scope
     async with catalog_verification_scope():
@@ -222,6 +253,11 @@ async def _calculate(db, order, aggregator, evidence, session, now, catalog_snap
         mapping = None
         if not isinstance(namespace, str) or not namespace.strip() or not identity_key:
             review.append("SOURCE_NAMESPACE_OR_IDENTITY_REQUIRED")
+        elif namespace == MEDICLOUD_NAMESPACE:
+            mapping = await verified_source_resolution(db, med, source_code, description, blocked, session)
+        elif is_reserved_namespace(namespace):
+            # System namespaces are server-assigned; any other one on a medication is invalid.
+            blocked.append("SOURCE_NAMESPACE_RESERVED")
         else:
             head = await db.pa_mapping_heads.find_one({"sourceNamespaceId": namespace,
                 "sourceIdentityType": identity_type, "sourceIdentityKey": identity_key}, session=session)

@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from core.pa_preparation_store import DomainConflict, event, now_utc, transaction
 from core.pa_catalog_provenance import verify_snapshot, verified_lookup_context
+from core.pa_source_namespaces import is_reserved_namespace
 from models.pa_preparation import Actor, CatalogEntry, CatalogEvidence, CatalogValidationEvidence, MappingProposal, ReviewEvidence
 
 
@@ -155,11 +156,19 @@ async def promote_catalog_trust(db, actor, snapshot_id, validation_evidence_id):
     return await db.pa_procedure_catalog_snapshots.find_one({"_id": snapshot_id})
 
 
-async def canonical_procedure(db, snapshot_id, code, session=None, *, existing_mapping=None, reserved_delivery=False):
+async def canonical_procedure(db, snapshot_id, code, session=None, *, existing_mapping=None, reserved_delivery=False,
+                              verified_source=None):
     # Resolution only for the fixed reserved delivery contract, never arbitrary codes
     # or authorization of a new mapping/catalog lifecycle transition.
-    if reserved_delivery and (code != "PRE11" or existing_mapping is not None):
+    if reserved_delivery and (code != "PRE11" or existing_mapping is not None or verified_source is not None):
         raise DomainConflict("RESERVED_DELIVERY_PROCEDURE_REQUIRED")
+    # Verified source binding: an exact MediCloud code recorded against this snapshot.
+    # Like existing mappings it resolves without the 24-hour new-authorization limit,
+    # but every trust, revocation, signature and integrity check below still applies.
+    if verified_source is not None and (existing_mapping is not None or not isinstance(verified_source, dict)
+            or verified_source.get("snapshotId") != snapshot_id or verified_source.get("code") != code
+            or not isinstance(code, str) or normalized_code(code) == "PRE11"):
+        raise DomainConflict("VERIFIED_SOURCE_BINDING_INVALID")
     snapshot = await db.pa_procedure_catalog_snapshots.find_one({"_id": snapshot_id}, session=session)
     if not snapshot or snapshot["status"] != "TRUSTED" or snapshot.get('revokedAt'):
         raise DomainConflict("TRUSTED_PROCEDURE_SNAPSHOT_REQUIRED")
@@ -181,7 +190,8 @@ async def canonical_procedure(db, snapshot_id, code, session=None, *, existing_m
         if (not head or head.get('activeVersion') != version or not active or active.get('status') != 'ACTIVE'
                 or active.get('snapshotId') != snapshot_id or active.get('medicloudCode') != code):
             raise DomainConflict('EXISTING_ACTIVE_MAPPING_REQUIRED')
-    verified = await verified_lookup_context(db, snapshot, validation, session, authorization=existing_mapping is None and not reserved_delivery)
+    verified = await verified_lookup_context(db, snapshot, validation, session,
+        authorization=existing_mapping is None and not reserved_delivery and verified_source is None)
     provenance = verified['provenance']
     if (validation.get('manifestDigest') != provenance['manifestDigest']
             or validation.get('signingKeyFingerprint') != provenance['signingKeyFingerprint']):
@@ -192,6 +202,8 @@ async def canonical_procedure(db, snapshot_id, code, session=None, *, existing_m
         raise DomainConflict("PROCEDURE_CODE_NOT_FOUND")
     if (entry.get('procedureCode'), entry.get('procedureDescription')) != verified['entries'].get(normalized_code(code)):
         raise DomainConflict('CATALOG_ENTRY_INTEGRITY_INVALID')
+    if verified_source is not None and entry.get('procedureCode') != code:
+        raise DomainConflict('VERIFIED_SOURCE_BINDING_INVALID')
     desc = entry.get("procedureDescription", "")
     if not desc.strip() or normalized_code(desc) == entry["normalizedCode"]:
         raise DomainConflict("CANONICAL_DESCRIPTION_REQUIRED")
@@ -200,6 +212,8 @@ async def canonical_procedure(db, snapshot_id, code, session=None, *, existing_m
 
 async def propose_mapping(db, actor, proposal: MappingProposal):
     require_permission(actor, "canProposeMappings")
+    if is_reserved_namespace(proposal.identity.sourceNamespaceId):
+        raise DomainConflict("RESERVED_SOURCE_NAMESPACE")
     identity = proposal.identity.model_dump()
     if proposal.identity.sourceIdentityType == "CODE":
         if not proposal.sourceCode or normalized_code(proposal.sourceCode) != proposal.identity.sourceIdentityKey:
@@ -240,6 +254,8 @@ async def revise_mapping(db, actor, mapping_id, expected_version, status, *, sna
         head = await db.pa_mapping_heads.find_one({"_id": mapping_id}, session=session)
         if not head or head["version"] != expected_version:
             raise DomainConflict("MAPPING_VERSION_CONFLICT")
+        if is_reserved_namespace(head.get("sourceNamespaceId")) and status != "RETIRED":
+            raise DomainConflict("RESERVED_SOURCE_NAMESPACE")
         previous = await db.pa_mapping_versions.find_one(
             {"mappingId": mapping_id, "version": expected_version}, session=session)
         if not previous:

@@ -11,6 +11,7 @@ from bson import ObjectId
 from core import pa_preparation as preparation
 from core.pa_mapping import normalized_code, require_permission, next_mapping_version
 from core.pa_preparation_store import DomainConflict, event, now_utc, transaction
+from core.pa_source_namespaces import is_reserved_namespace
 from models.pa_preparation import MappingIdentity, MappingProposal, MemberEvidence, PreparationLineEvidence
 
 MAX_ROWS = 100
@@ -91,8 +92,10 @@ async def live_line(db, row, session):
 
 
 def actionable(live):
+    # System namespaces (verified MediCloud codes, delivery) never enter manual review.
     return (live['mappingValidation'] == 'REVIEW_REQUIRED'
-        and bool(live.get('sourceNamespaceId')) and bool(live.get('sourceIdentityKey'))
+        and bool(live.get('sourceNamespaceId')) and not is_reserved_namespace(live.get('sourceNamespaceId'))
+        and bool(live.get('sourceIdentityKey'))
         and bool(live.get('sourceDescription', '').strip())
         and not (set(live['blockingReasons']) - {'MEMBER_EVIDENCE_INVALID_OR_STALE', 'MAPPING_CATALOG_EVIDENCE_INVALID'})
         and 'SOURCE_NAMESPACE_OR_IDENTITY_REQUIRED' not in live['reviewReasons'])
@@ -296,6 +299,8 @@ async def append_proposal(db, actor, binding, suggestion, export_id, session, ro
     never changes the current/active pointer or invalidates preparation.
     """
     require_permission(actor, 'canImportMappings')
+    if is_reserved_namespace(binding['identity'].get('sourceNamespaceId')):
+        raise DomainConflict('RESERVED_SOURCE_NAMESPACE')
     proposal = MappingProposal(identity=MappingIdentity(**binding['identity']), sourceCode=binding['sourceCode'],
         sourceDescription=binding['sourceDescription'], proposedMedicloudCode=suggestion['code'], mappingSource='CURSOR')
     head = await db.pa_mapping_heads.find_one(binding['identity'], session=session)

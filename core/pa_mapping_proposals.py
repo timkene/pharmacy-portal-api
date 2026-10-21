@@ -3,6 +3,7 @@ from copy import deepcopy
 from uuid import uuid4
 from core import pa_mapping as mappings, pa_mapping_review as transfer
 from core.pa_preparation_store import DomainConflict, transaction, event, now_utc
+from core.pa_source_namespaces import is_reserved_namespace
 from models.pa_preparation import MappingIdentity, MappingProposal
 
 IDENTITY = transfer.IDENTITY
@@ -45,6 +46,8 @@ async def import_receipt(db,row,session):
 
 async def immutable_source(db,row,session):
     # Stale rejection needs original integrity, never current source eligibility.
+    if is_reserved_namespace(row.get('sourceNamespaceId')):
+        raise DomainConflict('RESERVED_SOURCE_NAMESPACE')
     MappingProposal.model_validate({k:row[k] for k in MappingProposal.model_fields if k!='identity'} |
         {'identity':MappingIdentity(**{k:row[k] for k in IDENTITY})})
     if (row['sourceIdentityType']=='CODE' and mappings.normalized_code(row['sourceCode'])!=row['sourceIdentityKey']

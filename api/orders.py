@@ -22,6 +22,7 @@ from core.klaire_client import (
 )
 from core.security import decode_session, generate_intake_id
 from core.pricing import medication_docs, price_lines, subtotal, totals, money
+from core.pa_source_identity import verify_medications
 from core.sse import sse_manager
 
 _PHARMACY_SERVICE_KEY = os.getenv("PHARMACY_SERVICE_KEY", "")
@@ -375,7 +376,9 @@ async def create_order(
         "intakeId": generate_intake_id(),
         "enrollee": body.enrollee.model_dump(),
         "provider": body.provider.model_dump(),
-        "medications": medication_docs([m.model_dump(exclude={"lineId"}) for m in body.medications]),
+        # Source identity is assigned server-side only; client fields are never trusted.
+        "medications": await verify_medications(db, medication_docs([m.model_dump(exclude={"lineId"}) for m in body.medications]),
+                                                staff_user["userId"]),
         "status": "pending_review",
         "winnerId": None,
         "winnerName": None,
@@ -504,7 +507,7 @@ async def update_order(
     staff_session: str | None = Cookie(default=None),
     x_service_key: str = Header(default=""),
 ):
-    _require_staff(staff_session, x_service_key)
+    staff_user = _require_staff(staff_session, x_service_key)
     db = get_db()
 
     order = await load_order(db, order_id)
@@ -527,7 +530,9 @@ async def update_order(
                                        or not (med.diagnosisCode or "").strip() or med.quantity <= 0
                                        for med in body.medications):
             raise HTTPException(422, "Each medication needs a non-PRE11 procedure code, diagnosis code, and positive quantity")
-        patch["medications"] = medication_docs([m.model_dump(exclude={"lineId"}) for m in body.medications])
+        # Edited medications are re-verified; previous source identity is never carried over.
+        patch["medications"] = await verify_medications(
+            db, medication_docs([m.model_dump(exclude={"lineId"}) for m in body.medications]), staff_user["userId"])
 
     # Editing a rejected order moves it back to pending_review for re-review
     unset = None

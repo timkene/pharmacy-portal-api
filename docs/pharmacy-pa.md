@@ -787,3 +787,74 @@ visible separately. Existing ACTIVE resolution is explicitly distinguished from
 new authorization. None of these display fields replaces mutation-time source,
 permission, concurrency, freshness or reconciliation checks, nor establishes
 provider tariff, coverage or price eligibility. No IssuePa call path is added.
+
+### Source identity — verified MediCloud codes
+
+Order intake (`POST /api/orders`, `PUT /api/orders/{id}` medications, staff
+session or service key) assigns source identity server-side through
+`core.pa_source_identity.verify_medications`. Client-supplied `sourceNamespaceId`,
+`sourceCode`, `sourceDescription` and `sourceVerification` are always discarded;
+the response contract is unchanged.
+
+- `SYSTEM_MEDICLOUD_PROCEDURE`: the exact `procedureCode` exists in the newest
+  trusted, unrevoked catalog snapshot and the intake label matches the canonical
+  description (trimmed, case-insensitive). `sourceVerification` records method
+  `TRUSTED_CATALOG_EXACT_CODE`, snapshot ID, canonical code and description,
+  time and actor.
+- `PHARMACY_INTAKE_CODE`: anything else (unknown code, case/form difference,
+  description mismatch, PRE11, no trusted catalog or a catalog outage), with
+  method `UNVERIFIED_INTAKE_CODE` and a reason. These lines are eligible for the
+  manual mapping review export and stay REVIEW_REQUIRED until an approved,
+  activated mapping exists. Intake is never blocked by catalog problems.
+
+Preparation resolves `SYSTEM_MEDICLOUD_PROCEDURE` lines directly through
+`canonical_procedure(..., verified_source=...)` against the recorded snapshot,
+with no mapping record (`mappingSource` `VERIFIED_MEDICLOUD_CATALOG`). Like an
+existing active mapping it uses existing-resolution freshness (no 24-hour
+limit), but trusted status, revocation, three distinct provenance actors,
+signature, content integrity and the exact code and description binding are all
+re-checked; any failure blocks with `MAPPING_CATALOG_EVIDENCE_INVALID`, and an
+inconsistent verification record blocks with `SOURCE_VERIFICATION_INVALID`.
+Member evidence, price, provider, ledger and every other readiness check still
+apply, so a trusted catalog entry alone never makes a line READY. Nothing is
+authorized or transmitted.
+
+Namespaces starting with `SYSTEM_` are reserved. Mapping proposal, import,
+revision (other than retirement), approval and activation refuse them with
+`RESERVED_SOURCE_NAMESPACE`, and they are never exported for review, so the
+three-person mapping workflow continues to govern every other namespace.
+
+Existing orders are handled only by `python -m scripts.backfill_pa_source_identity`
+with three explicit commands. It never runs automatically.
+
+- `plan --mode unstamped | reverify-unverified [--reason R ...] | reverify-revoked
+  --plan-file PATH` is read-only. It refuses unless the snapshot (explicit
+  `--snapshot-id` or the newest trusted one) passes full trust, revocation,
+  three-actor, signature and integrity checks. It pages orders by `_id` with a
+  projection and database-side filters (bounded by `--limit`/`--batch-size`) and
+  writes a canonical plan file that is never overwritten. Each listed order
+  records its ID, version, current medications hash, planned medications and
+  planned medications hash. The command prints the plan's SHA-256 digest.
+  `reverify-unverified` re-stamps only unverified lines that now verify (optionally
+  by reason); `reverify-revoked` re-stamps only verified lines bound to a revoked,
+  untrusted or receipt-revoked snapshot. Unaffected lines and orders are never
+  re-stamped, and any change that would turn a verified line unverified skips
+  the order as `REVERIFY_WOULD_DOWNGRADE`.
+- `apply --plan-file --approved-plan-hash --operator --run-id` recomputes the
+  plan digest, validates every per-order planned hash, re-verifies the snapshot,
+  and writes only listed orders. Inside each transaction it re-reads the order and
+  skips it if its version, medications, eligibility or transmission state
+  changed. Newly discovered orders are never added. Each write increments
+  `version` (staling preparations), stores `sourceIdentityBackfill` with the
+  previous medications, post-backfill version and medications hash, keeps any
+  earlier record in `sourceIdentityBackfillHistory`, and appends a
+  `pa_source_identity_backfilled` history event.
+- `rollback --run-id --confirm-run-id --operator` restores the previous
+  medications only where the order still has exactly the post-backfill version
+  and medications hash and no transmission evidence, then increments `version`
+  and appends `pa_source_identity_backfill_rolled_back`. Repeats report
+  `ALREADY_ROLLED_BACK`; later changes report `CHANGED_AFTER_BACKFILL`.
+
+Orders with PA transmission evidence, a PA reference owner, a
+cancelled/rejected/recalled status or malformed medications are never planned,
+applied or rolled back.

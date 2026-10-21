@@ -180,7 +180,8 @@ async def line_view(db, row, source, batch, contexts=None):
         and isinstance(live.get("medicloudDescription"), str) and live["medicloudDescription"].strip())
     mapping_status = "UNMAPPED"
     if effective_mapping:
-        mapping_status = "VALIDATED" if live.get("mappingSource") == "RESERVED_DELIVERY_CONTRACT" else "ACTIVE"
+        # System-resolved catalog bindings (no mapping record) use the existing VALIDATED label.
+        mapping_status = "VALIDATED" if live.get("mappingSource") in ("RESERVED_DELIVERY_CONTRACT", "VERIFIED_MEDICLOUD_CATALOG") else "ACTIVE"
     elif live and mapped.get("sourceNamespaceId"):
         head = await db.pa_mapping_heads.find_one({"sourceNamespaceId": mapped["sourceNamespaceId"],
             "sourceIdentityType": mapped["sourceIdentityType"], "sourceIdentityKey": mapped["sourceIdentityKey"]})
