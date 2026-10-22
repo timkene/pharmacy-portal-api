@@ -4,7 +4,8 @@ Never runs on application startup or automatically. Three explicit commands:
 
   plan     Read-only. Writes a deterministic plan file and prints its SHA-256 digest.
            --mode unstamped | reverify-unverified [--reason R ...] | reverify-revoked
-  apply    Writes only the orders listed in an approved plan:
+  apply    Writes only the orders listed in an approved plan, and only within four
+           hours of the plan's hashed creation time:
            --plan-file PATH --approved-plan-hash HEX --operator STAFF_ID --run-id RUN_ID
   rollback Restores the pre-backfill medications of one run, only where the order is
            still exactly as the backfill left it:
@@ -25,7 +26,7 @@ import json
 import os
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from bson import ObjectId
 
@@ -43,6 +44,10 @@ HASH_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 DEFAULT_BATCH_SIZE = 200
 MAX_BATCH_SIZE = 1000
 MAX_PLAN_ORDERS = 100_000
+# A plan may be applied only within this window after it was created (not approved).
+MAX_PLAN_AGE = timedelta(hours=4)
+# Small allowance for clock differences between the planning and applying hosts.
+PLAN_CLOCK_SKEW = timedelta(minutes=5)
 PROJECTION = {"_id": 1, "version": 1, "status": 1, "medications": 1, "paGeneration": 1, "sourceIdentityBackfill": 1}
 
 
@@ -252,8 +257,11 @@ async def build_plan(db, *, mode, reasons=(), snapshot_id=None, limit=None, batc
             else:
                 unverified[(line.get("sourceVerification") or {}).get("reason", "UNKNOWN")] += 1
         orders.append(entry)
+    # Creation time is set by this tool, never by an argument, and is covered by the plan hash.
+    created = now_utc()
+    created = created.replace(microsecond=(created.microsecond // 1000) * 1000)
     plan = json.loads(canonical_json({"planVersion": PLAN_VERSION, "mode": mode, "reasons": list(reasons),
-        "snapshotId": snapshot_id, "unusableSnapshotIds": unusable, "createdAt": now_utc(),
+        "snapshotId": snapshot_id, "unusableSnapshotIds": unusable, "createdAt": created,
         "createdBy": created_by, "orders": orders}))
     report = {"command": "plan", "mode": mode, "snapshotId": snapshot_id, "ordersScanned": scanned,
               "ordersPlanned": len(orders), "verifiedLines": verified, "unverifiedLines": dict(unverified),
@@ -283,6 +291,28 @@ def _restore_medications(planned):
     return restored
 
 
+def plan_created_at(plan):
+    """Parse the hashed creation time; only an explicit UTC ISO timestamp is accepted."""
+    value = plan.get("createdAt") if isinstance(plan, dict) else None
+    try:
+        created = datetime.fromisoformat(value) if isinstance(value, str) else None
+    except ValueError:
+        created = None
+    if created is None or created.tzinfo is None or created.utcoffset() != timedelta(0):
+        raise BackfillRefused("PLAN_TIMESTAMP_INVALID")
+    return created
+
+
+def require_plan_age(plan, now=None):
+    """Reject plans older than MAX_PLAN_AGE or dated beyond the allowed clock skew."""
+    now = now or now_utc()
+    created = plan_created_at(plan)
+    if created - now > PLAN_CLOCK_SKEW:
+        raise BackfillRefused("PLAN_FUTURE_DATED")
+    if now - created > MAX_PLAN_AGE:
+        raise BackfillRefused("PLAN_EXPIRED")
+
+
 def validate_plan(plan, approved_hash):
     if not isinstance(approved_hash, str) or not HASH_PATTERN.match(approved_hash) or plan_digest(plan) != approved_hash:
         raise BackfillRefused("PLAN_HASH_MISMATCH")
@@ -290,6 +320,7 @@ def validate_plan(plan, approved_hash):
             or not isinstance(plan.get("snapshotId"), str) or not isinstance(plan.get("orders"), list)
             or len(plan["orders"]) > MAX_PLAN_ORDERS):
         raise BackfillRefused("PLAN_INVALID")
+    require_plan_age(plan)
     seen = set()
     for entry in plan["orders"]:
         if (not isinstance(entry, dict) or not ObjectId.is_valid(entry.get("orderId")) or entry["orderId"] in seen

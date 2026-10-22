@@ -841,7 +841,14 @@ with three explicit commands. It never runs automatically.
   re-stamped, and any change that would turn a verified line unverified skips
   the order as `REVERIFY_WOULD_DOWNGRADE`.
 - `apply --plan-file --approved-plan-hash --operator --run-id` recomputes the
-  plan digest, validates every per-order planned hash, re-verifies the snapshot,
+  plan digest and enforces the **four-hour rule**: the plan's `createdAt`, set by
+  `plan` itself and covered by the hash, must be an explicit UTC ISO timestamp,
+  no more than 5 minutes in the future (clock skew) and no more than 4 hours old
+  at apply time. Age is measured from plan creation, not approval. Malformed,
+  future-dated or expired plans are refused (`PLAN_TIMESTAMP_INVALID`,
+  `PLAN_FUTURE_DATED`, `PLAN_EXPIRED`) before any snapshot or order check, and
+  nothing is written; create and approve a new plan instead. Apply then
+  validates every per-order planned hash, re-verifies the snapshot,
   and writes only listed orders. Inside each transaction it re-reads the order and
   skips it if its version, medications, eligibility or transmission state
   changed. Newly discovered orders are never added. Each write increments

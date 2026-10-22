@@ -429,6 +429,101 @@ def test_selection_filters_use_database_side_eligibility():
     assert revoked["medications"]["$elemMatch"]["sourceVerification.snapshotId"] == {"$in": ["snap-a"]}
 
 
+# --- Maximum plan age (4 hours from creation) ---------------------------------------------
+
+def at(monkeypatch, moment):
+    monkeypatch.setattr(backfill, "now_utc", lambda: moment)
+
+
+def rehash(plan, **changes):
+    changed = {**deepcopy(plan), **changes}
+    return changed, backfill.plan_digest(changed)
+
+
+@pytest.mark.asyncio
+async def test_plan_records_a_hashed_utc_creation_time(setup):
+    env = setup
+    plan, report = await backfill.build_plan(env.db, mode="unstamped", snapshot_id=env.snap["_id"])
+    created = backfill.plan_created_at(plan)
+    assert created.utcoffset() == timedelta(0) and created.microsecond % 1000 == 0
+    assert abs(now_utc() - created) < timedelta(minutes=1)
+    tampered = {**deepcopy(plan), "createdAt": now_utc().isoformat()}
+    with pytest.raises(BackfillRefused, match="PLAN_HASH_MISMATCH"):  # Covered by the approved hash.
+        await backfill.apply_plan(env.db, tampered, approved_hash=report["planHash"], operator="ops", run_id="run-001")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age", [timedelta(0), timedelta(hours=3, minutes=59), timedelta(hours=4)])
+async def test_plan_within_four_hours_applies(setup, monkeypatch, age):
+    env = setup
+    plan, report = await backfill.build_plan(env.db, mode="unstamped", snapshot_id=env.snap["_id"])
+    at(monkeypatch, backfill.plan_created_at(plan) + age)
+    result = await backfill.apply_plan(env.db, plan, approved_hash=report["planHash"], operator="ops", run_id="run-001")
+    assert result["ordersApplied"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("age", [timedelta(hours=4, milliseconds=1), timedelta(days=2)])
+async def test_expired_plan_is_rejected_without_writes(setup, monkeypatch, age):
+    env = setup
+    plan, report = await backfill.build_plan(env.db, mode="unstamped", snapshot_id=env.snap["_id"])
+    before = deepcopy(env.db.orders.rows)
+    at(monkeypatch, backfill.plan_created_at(plan) + age)
+    with pytest.raises(BackfillRefused, match="PLAN_EXPIRED"):
+        await backfill.apply_plan(env.db, plan, approved_hash=report["planHash"], operator="ops", run_id="run-001")
+    assert env.db.orders.rows == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["not-a-date", "", None, 1729500000, "2026-10-21T09:00:00",
+                                   "2026-10-21T10:00:00+01:00", "2026-13-40T00:00:00+00:00"])
+async def test_malformed_creation_time_is_rejected_without_writes(setup, value):
+    env = setup
+    plan, _ = await backfill.build_plan(env.db, mode="unstamped", snapshot_id=env.snap["_id"])
+    plan, digest = rehash(plan, createdAt=value)  # Even a correctly re-hashed plan is refused.
+    before = deepcopy(env.db.orders.rows)
+    with pytest.raises(BackfillRefused, match="PLAN_TIMESTAMP_INVALID"):
+        await backfill.apply_plan(env.db, plan, approved_hash=digest, operator="ops", run_id="run-001")
+    assert env.db.orders.rows == before
+
+
+@pytest.mark.asyncio
+async def test_missing_creation_time_is_rejected(setup):
+    env = setup
+    plan, _ = await backfill.build_plan(env.db, mode="unstamped", snapshot_id=env.snap["_id"])
+    plan.pop("createdAt")
+    with pytest.raises(BackfillRefused, match="PLAN_TIMESTAMP_INVALID"):
+        await backfill.apply_plan(env.db, plan, approved_hash=backfill.plan_digest(plan), operator="ops", run_id="run-001")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ahead,allowed", [(timedelta(minutes=4), True), (timedelta(minutes=5, seconds=1), False),
+                                           (timedelta(days=1), False)])
+async def test_future_dated_plan_beyond_clock_skew_is_rejected(setup, monkeypatch, ahead, allowed):
+    env = setup
+    plan, _ = await backfill.build_plan(env.db, mode="unstamped", snapshot_id=env.snap["_id"])
+    plan, digest = rehash(plan, createdAt=(now_utc() + ahead).isoformat())
+    at(monkeypatch, now_utc())
+    before = deepcopy(env.db.orders.rows)
+    if allowed:
+        result = await backfill.apply_plan(env.db, plan, approved_hash=digest, operator="ops", run_id="run-001")
+        assert result["ordersApplied"] == 1
+    else:
+        with pytest.raises(BackfillRefused, match="PLAN_FUTURE_DATED"):
+            await backfill.apply_plan(env.db, plan, approved_hash=digest, operator="ops", run_id="run-001")
+        assert env.db.orders.rows == before
+
+
+@pytest.mark.asyncio
+async def test_age_check_runs_before_snapshot_and_order_checks(setup, monkeypatch):
+    env = setup
+    plan, report = await backfill.build_plan(env.db, mode="unstamped", snapshot_id=env.snap["_id"])
+    revoke(env, env.snap)  # Would also be refused, but the age rule must reject first.
+    at(monkeypatch, backfill.plan_created_at(plan) + timedelta(hours=5))
+    with pytest.raises(BackfillRefused, match="PLAN_EXPIRED"):
+        await backfill.apply_plan(env.db, plan, approved_hash=report["planHash"], operator="ops", run_id="run-001")
+
+
 def test_transmission_evidence_detection():
     assert not backfill.transmission_evidence({})
     assert not backfill.transmission_evidence({"paGeneration": {"lines": [{"lineId": "a", "status": "pending"}]}})
