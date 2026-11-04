@@ -1,3 +1,4 @@
+from bson import ObjectId
 from fastapi import APIRouter, Cookie, HTTPException
 
 from core.database import get_db
@@ -12,6 +13,20 @@ def _require_aggregator(aggregator_session: str | None) -> dict:
     user = decode_session(aggregator_session, "aggregator")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid aggregator session")
+    if user.get("limited"):
+        raise HTTPException(403, detail={"code": "password_required", "message": "Password change required"})
+    return user
+
+
+async def _require_access(aggregator_session: str | None) -> dict:
+    user = _require_aggregator(aggregator_session)
+    lookup = ObjectId(user["userId"]) if ObjectId.is_valid(user["userId"]) else user["userId"]
+    db_user = await get_db().aggregator_users.find_one({"_id": lookup})
+    if db_user and db_user.get("mustChangePassword"):
+        raise HTTPException(403, detail={"code": "password_required", "message": "Password change required"})
+    if db_user and (("emailVerified" in db_user and not db_user.get("email")) or db_user.get("emailVerified") is False):
+        code = "email_required" if not db_user.get("email") else "email_unverified"
+        raise HTTPException(403, detail={"code": code, "message": "Email onboarding required"})
     return user
 
 
@@ -48,11 +63,11 @@ async def aggregator_orders_list(
     aggregator_session: str | None = Cookie(default=None),
 ):
     """All orders relevant to this aggregator — open sessions, active won orders, fulfilled."""
-    agg_user = _require_aggregator(aggregator_session)
+    agg_user = await _require_access(aggregator_session)
     agg_id = agg_user["userId"]
     db = get_db()
 
-    open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
+    open_cursor = db.orders.find({"status": "bidding", "winnerId": agg_id}).sort("biddingEndsAt", 1)
     open_orders = [_serialize_order(o) async for o in open_cursor]
 
     active_statuses = ["direct_quote_requested", "direct_price_review", "awaiting_fulfillment", "accepted", "awaiting_confirmation"]
@@ -82,12 +97,12 @@ async def aggregator_orders_list(
 async def aggregator_dashboard(
     aggregator_session: str | None = Cookie(default=None),
 ):
-    agg_user = _require_aggregator(aggregator_session)
+    agg_user = await _require_access(aggregator_session)
     agg_id = agg_user["userId"]
     db = get_db()
 
     # Open bidding sessions (any aggregator can see these to place bids)
-    open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
+    open_cursor = db.orders.find({"status": "bidding", "winnerId": agg_id}).sort("biddingEndsAt", 1)
     open_orders = [_serialize_order(o) async for o in open_cursor]
 
     # Orders this aggregator won that are still active

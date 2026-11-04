@@ -72,7 +72,27 @@ def _require_aggregator(aggregator_session: str | None) -> dict:
     user = decode_session(aggregator_session, "aggregator")
     if not user:
         raise HTTPException(status_code=401, detail="Invalid aggregator session")
+    if user.get("limited"):
+        raise HTTPException(403, detail={"code": "password_required", "message": "Password change required"})
     return user
+
+
+async def _require_aggregator_onboarding(user: dict) -> None:
+    if not ObjectId.is_valid(user["userId"]):
+        return
+    owner = await get_db().aggregator_users.find_one({"_id": ObjectId(user["userId"])})
+    if owner and owner.get("mustChangePassword"):
+        raise HTTPException(403, detail={"code": "password_required", "message": "Password change required"})
+    if owner and "emailVerified" in owner and not owner.get("email"):
+        raise HTTPException(403, detail={"code": "email_required", "message": "Email registration required"})
+    if owner and owner.get("emailVerified") is False:
+        raise HTTPException(403, detail={"code": "email_unverified", "message": "Email verification required"})
+
+
+async def _require_aggregator_order_access(user: dict, order: dict) -> None:
+    await _require_aggregator_onboarding(user)
+    if order.get("winnerId") != user["userId"]:
+        raise HTTPException(status_code=403, detail="Order is not assigned to this aggregator")
 
 
 def _require_any(
@@ -661,8 +681,8 @@ async def get_order(
     db = get_db()
 
     order = await check_and_close_bidding(order_id, db)
-    if role == "aggregator" and order.get("assignmentType") == "direct":
-        require_direct(order, user)
+    if role == "aggregator":
+        await _require_aggregator_order_access(user, order)
 
     bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
     raw_bids = await bids_cursor.to_list(None)
@@ -701,8 +721,8 @@ async def order_stream(
     db = get_db()
 
     initial_order = await load_order(db, order_id)
-    if role == "aggregator" and initial_order.get("assignmentType") == "direct":
-        require_direct(initial_order, user)
+    if role == "aggregator":
+        await _require_aggregator_order_access(user, initial_order)
 
     async def event_generator() -> AsyncGenerator[str, None]:
         order = await check_and_close_bidding(order_id, db)
@@ -836,6 +856,7 @@ async def accept_order(
     db = get_db()
 
     order = await load_order(db, order_id)
+    await _require_aggregator_onboarding(agg_user)
 
     if order.get("status") != "awaiting_fulfillment":
         raise HTTPException(status_code=400, detail="Order is not awaiting fulfillment")
@@ -880,6 +901,7 @@ async def fulfill_order(
     db = get_db()
 
     order = await load_order(db, order_id)
+    await _require_aggregator_onboarding(agg_user)
 
     if order.get("status") != "accepted":
         raise HTTPException(status_code=400, detail="Order must be in accepted status to mark as fulfilled")
@@ -1064,10 +1086,11 @@ async def list_aggregators(
 ):
     _require_staff(staff_session, x_service_key)
     rows = await get_db().aggregator_users.find(
-        {}, {"companyName": 1, "contactName": 1, "email": 1}
+        {}, {"companyName": 1, "contactName": 1, "email": 1, "medicloudProviderId": 1}
     ).to_list(None)
     return [{"id": str(row["_id"]), "companyName": row.get("companyName"),
-             "contactName": row.get("contactName"), "email": row.get("email")} for row in rows]
+             "contactName": row.get("contactName"), "email": row.get("email"),
+             "medicloudProviderId": row.get("medicloudProviderId")} for row in rows]
 
 
 @router.post("/orders/{order_id}/assign")
@@ -1120,6 +1143,7 @@ async def submit_direct_quote(
     actor = _require_aggregator(aggregator_session)
     db = get_db()
     order = await load_order(db, order_id)
+    await _require_aggregator_order_access(actor, order)
     require_direct(order, actor)
     check_version(order, body.expectedVersion)
     if order["status"] != "direct_quote_requested":

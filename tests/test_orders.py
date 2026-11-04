@@ -142,7 +142,7 @@ def test_unknown_aggregator(api, agg_id):
 
 def test_aggregators_staff_only(api):
     client, _, doc, aggregator, _ = api
-    assert client.get('/api/aggregators').json() == [{"id": str(aggregator["_id"]), "companyName": "Pharmacy", "contactName": "Contact", "email": "test@example.com"}]
+    assert client.get('/api/aggregators').json() == [{"id": str(aggregator["_id"]), "companyName": "Pharmacy", "contactName": "Contact", "email": "test@example.com", "medicloudProviderId": None}]
     client.cookies.clear()
     assert client.get('/api/aggregators').status_code == 401
     assert client.post(f'/api/orders/{doc["_id"]}/assign', json={"aggregatorId": str(aggregator["_id"])}).status_code == 401
