@@ -67,7 +67,7 @@ async def aggregator_orders_list(
     agg_id = agg_user["userId"]
     db = get_db()
 
-    open_cursor = db.orders.find({"status": "bidding", "winnerId": agg_id}).sort("biddingEndsAt", 1)
+    open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
     open_orders = [_serialize_order(o) async for o in open_cursor]
 
     active_statuses = ["direct_quote_requested", "direct_price_review", "awaiting_fulfillment", "accepted", "awaiting_confirmation"]
@@ -102,7 +102,7 @@ async def aggregator_dashboard(
     db = get_db()
 
     # Open bidding sessions (any aggregator can see these to place bids)
-    open_cursor = db.orders.find({"status": "bidding", "winnerId": agg_id}).sort("biddingEndsAt", 1)
+    open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
     open_orders = [_serialize_order(o) async for o in open_cursor]
 
     # Orders this aggregator won that are still active

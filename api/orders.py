@@ -91,7 +91,7 @@ async def _require_aggregator_onboarding(user: dict) -> None:
 
 async def _require_aggregator_order_access(user: dict, order: dict) -> None:
     await _require_aggregator_onboarding(user)
-    if order.get("winnerId") != user["userId"]:
+    if order.get("status") != "bidding" and order.get("winnerId") != user["userId"]:
         raise HTTPException(status_code=403, detail="Order is not assigned to this aggregator")
 
 

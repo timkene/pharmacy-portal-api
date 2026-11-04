@@ -37,7 +37,7 @@ def normalize_username(value: str) -> str:
 
 def _limit(request: Request, action: str, identifier: str, maximum: int = 10) -> None:
     now = time.monotonic()
-    key = (action, f"{request.client.host if request.client else 'unknown'}:{identifier[:160].lower()}")
+    key = (action, f"{request.client.host if request.client else 'unknown'}:{normalize_username(identifier)[:160]}")
     values = [stamp for stamp in _attempts.get(key, []) if now - stamp < 60]
     if len(values) >= maximum:
         raise HTTPException(429, detail="Too many requests")
