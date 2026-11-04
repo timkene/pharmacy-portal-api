@@ -24,22 +24,75 @@ class AggregatorSignupRequest(BaseModel):
 
 
 class AggregatorLoginRequest(BaseModel):
-    email: EmailStr
+    username: Optional[str] = None
+    email: Optional[EmailStr] = None
     password: str
+
+    def model_post_init(self, __context):
+        if not (self.username or self.email):
+            raise ValueError("username or email is required")
 
 
 class UserResponse(BaseModel):
     name: str
-    email: str
+    email: Optional[str] = None
 
 
-class StaffIdentityResponse(UserResponse):
+class AggregatorIdentityResponse(BaseModel):
+    name: str
+    email: Optional[str] = None
+    userId: str
+    mustChangePassword: Optional[bool] = None
+    emailVerified: Optional[bool] = None
+    hasEmail: Optional[bool] = None
+    medicloudProviderId: Optional[str] = None
+    companyName: Optional[str] = None
+
+
+class PasswordChangeRequest(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+
+class AggregatorEmailRequest(BaseModel):
+    email: EmailStr
+
+
+class TokenRequest(BaseModel):
+    token: Optional[str] = None
+    code: Optional[str] = None
+
+    def model_post_init(self, __context):
+        if not (self.token or self.code):
+            raise ValueError("token or code is required")
+
+
+class ForgotPasswordRequest(BaseModel):
+    identifier: Optional[str] = None
+    username: Optional[str] = None
+    email: Optional[EmailStr] = None
+
+    def model_post_init(self, __context):
+        value = self.identifier or self.username or (str(self.email) if self.email else None)
+        if not value or not value.strip():
+            raise ValueError("identifier, username, or email is required")
+        self.identifier = value.strip()
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    newPassword: str
+
+
+class StaffIdentityResponse(BaseModel):
+    name: str
+    email: Optional[str] = None
     userId: str
 
 
 class AuthResponse(BaseModel):
     success: bool
-    user: Optional[UserResponse] = None
+    user: Optional[UserResponse | AggregatorIdentityResponse] = None
     session: Optional[str] = None
 
 
