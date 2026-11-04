@@ -28,9 +28,12 @@ def onboarding(monkeypatch):
                 "winnerName": second["companyName"], "intakeId": "I1", "createdBy": "staff",
                 "createdAt": datetime.now(timezone.utc), "enrollee": {"fullName": "Patient"},
                 "medications": [], "bids": []}
+    bidding = {"_id": ObjectId(), "status": "bidding", "biddingEndsAt": datetime.now(timezone.utc) + timedelta(hours=1),
+               "intakeId": "I2", "createdBy": "staff", "createdAt": datetime.now(timezone.utc),
+               "enrollee": {"fullName": "Open Patient"}, "medications": [], "bids": []}
     db = SimpleNamespace(
         staff_users=Collection([staff]), aggregator_users=Collection([first, second]),
-        orders=Collection([assigned]), bids=Collection(),
+        orders=Collection([assigned, bidding]), bids=Collection(),
     )
     monkeypatch.setattr(auth, "get_db", lambda: db)
     monkeypatch.setattr(aggregator, "get_db", lambda: db)
@@ -62,6 +65,18 @@ def test_username_login_normalizes_whitespace_and_case(onboarding):
     response = login(client, "  ALPHA   PHARMACY ", "alpha-password")
     assert response.status_code == 200
     assert response.json()["user"]["companyName"] == "Alpha Pharmacy"
+
+
+def test_auth_rate_limit_normalizes_whitespace_variants(monkeypatch):
+    from fastapi import HTTPException
+
+    auth._attempts.clear()
+    request = SimpleNamespace(client=SimpleNamespace(host="test"))
+    for _ in range(10):
+        auth._limit(request, "login", "alpha pharmacy")
+    with pytest.raises(HTTPException) as exc:
+        auth._limit(request, "login", "  ALPHA   PHARMACY ")
+    assert exc.value.status_code == 429
 
 
 def test_must_change_password_gates_aggregator_orders(onboarding):
@@ -137,6 +152,86 @@ def test_aggregator_cannot_list_or_get_another_assigned_order(onboarding):
     assert listed.status_code == 200 and listed.json()["active"] == []
     order_id = str(db.orders.rows[0]["_id"])
     assert client.get(f"/api/orders/{order_id}").status_code == 403
+
+
+def test_bidding_orders_are_visible_and_readable_but_assigned_orders_are_isolated(onboarding):
+    client, db, first, second, _, _ = onboarding
+    assert login(client, "alpha pharmacy", "alpha-password").status_code == 200
+
+    listed = client.get("/api/aggregator/orders").json()
+    assert listed["open"] and listed["open"][0]["status"] == "bidding"
+    dashboard = client.get("/api/aggregator/dashboard").json()
+    assert dashboard["openSessions"] and dashboard["openSessions"][0]["status"] == "bidding"
+
+    bidding_id = str(db.orders.rows[1]["_id"])
+    assert client.get(f"/api/orders/{bidding_id}").status_code == 200
+    assert client.post(f"/api/orders/{bidding_id}/bids", json={"totalPrice": 100}).status_code == 200
+
+    assigned_id = str(db.orders.rows[0]["_id"])
+    assert client.get(f"/api/orders/{assigned_id}").status_code == 403
+
+
+class _SyncCollection:
+    def __init__(self, rows=()):
+        self.rows = [dict(row) for row in rows]
+
+    def find_one(self, query):
+        for row in self.rows:
+            if "usernameNormalized" in query and row.get("usernameNormalized") == query["usernameNormalized"]:
+                return row
+            if "companyName" in query and re.fullmatch(query["companyName"]["$regex"].strip("^$"), row.get("companyName", ""), re.IGNORECASE):
+                return row
+        return None
+
+    def update_one(self, query, update):
+        row = next(row for row in self.rows if row["_id"] == query["_id"])
+        row.update(update["$set"])
+
+    def insert_one(self, doc):
+        row = dict(doc)
+        row["_id"] = ObjectId()
+        self.rows.append(row)
+
+
+class _SyncClient:
+    def __init__(self, collection):
+        self.collection = collection
+        self.closed = False
+
+    def __getitem__(self, _name):
+        return SimpleNamespace(aggregator_users=self.collection)
+
+    def close(self):
+        self.closed = True
+
+
+def test_onboarding_seed_is_idempotent_without_password_reset(monkeypatch, capsys):
+    from scripts import upsert_onboarding_aggregators as seed
+
+    collection = _SyncCollection()
+    client = _SyncClient(collection)
+    monkeypatch.setenv("AGGREGATOR_TEMP_PASSWORD", "temporary-secret")
+    monkeypatch.setattr(seed, "MongoClient", lambda *args, **kwargs: client)
+    seed.run()
+    original_hash = collection.rows[0]["password_hash"]
+    seed.run()
+    assert collection.rows[0]["password_hash"] == original_hash
+    assert verify_password("temporary-secret", collection.rows[0]["password_hash"])
+    assert "temporary-secret" not in capsys.readouterr().out
+
+
+def test_onboarding_seed_refuses_username_company_collision(monkeypatch):
+    from scripts import upsert_onboarding_aggregators as seed
+
+    collection = _SyncCollection([
+        {"_id": ObjectId(), "usernameNormalized": "benson pharmacy", "companyName": "Other Owner"},
+        {"_id": ObjectId(), "usernameNormalized": "other", "companyName": "Benson Pharmacy"},
+    ])
+    client = _SyncClient(collection)
+    monkeypatch.setenv("AGGREGATOR_TEMP_PASSWORD", "temporary-secret")
+    monkeypatch.setattr(seed, "MongoClient", lambda *args, **kwargs: client)
+    with pytest.raises(RuntimeError, match="Refusing Benson Pharmacy"):
+        seed.run()
 
 
 def test_staff_identity_does_not_expose_aggregator_fields(onboarding):
