@@ -14,6 +14,8 @@ services:
         value: pharmacy_dispatch
       - key: ENVIRONMENT
         value: production
+      - key: FRONTEND_BASE_URL
+        value: https://pharmacy-portal-delta.vercel.app
       - key: MOTHERDUCK_TOKEN
         sync: false
       - key: MEDICLOUD_API_URL
