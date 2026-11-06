@@ -82,6 +82,14 @@ def generate(flow):
     return client.post(f'/api/orders/{doc["_id"]}/generate-pa', json={"expectedVersion": doc["version"]})
 
 
+def test_test_order_rejects_production_pa(pa_flow):
+    _, _, doc, _, calls = pa_flow
+    doc["isTest"] = True
+    response = generate(pa_flow)
+    assert response.status_code == 422
+    assert calls == []
+
+
 @pytest.mark.parametrize("count,delivery", [(1, False), (2, False), (1, True), (2, True)])
 def test_pickup_and_delivery_lines(pa_flow, count, delivery):
     client, _, doc, _, calls = pa_flow

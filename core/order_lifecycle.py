@@ -33,6 +33,7 @@ def require_direct(order, user=None):
 
 def lifecycle_fields(order):
     return {key: order.get(key, default) for key, default in {
+        "isTest": False,
         "version": 0, "assignmentVersion": 0, "directQuote": None,
         "priceApprovedAt": None, "fulfilledAt": None, "acceptedAt": None,
         "cancelledAt": None, "recalledAt": None,

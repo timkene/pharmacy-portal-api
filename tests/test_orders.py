@@ -120,6 +120,13 @@ def test_approve(api):
     notify.assert_called_once()
 
 
+def test_test_order_approval_does_not_notify_klaire(api):
+    client, _, doc, _, notify = api
+    doc["isTest"] = True
+    assert client.post(f'/api/orders/{doc["_id"]}/approve').status_code == 200
+    notify.assert_not_called()
+
+
 def test_assign(api):
     client, db, doc, aggregator, notify = api
     assert client.post(f'/api/orders/{doc["_id"]}/assign', json={"aggregatorId": str(aggregator["_id"])}).status_code == 200
@@ -131,6 +138,13 @@ def test_assign(api):
     assert db.bids.writes == 0 and db.bids.rows == []
     notify.assert_called_once()
     assert client.post(f'/api/orders/{doc["_id"]}/assign', json={"aggregatorId": str(aggregator["_id"])}).status_code == 400
+
+
+def test_assign_rejects_test_production_mismatch(api):
+    client, _, doc, aggregator, _, = api
+    aggregator["isTestAggregator"] = True
+    response = client.post(f'/api/orders/{doc["_id"]}/assign', json={"aggregatorId": str(aggregator["_id"])})
+    assert response.status_code == 403
 
 
 @pytest.mark.parametrize("agg_id", ["invalid", str(ObjectId())])

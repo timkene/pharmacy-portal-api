@@ -59,7 +59,7 @@ def _identity(user: dict) -> AggregatorIdentityResponse:
         userId=str(user["_id"]), name=user.get("companyName") or "Aggregator", email=email,
         companyName=user.get("companyName"), mustChangePassword=bool(user.get("mustChangePassword", False)),
         emailVerified=bool(user.get("emailVerified", bool(email))), hasEmail=bool(email),
-        medicloudProviderId=user.get("medicloudProviderId"),
+        medicloudProviderId=None if user.get("isTestAggregator", False) else user.get("medicloudProviderId"),
     )
 
 
