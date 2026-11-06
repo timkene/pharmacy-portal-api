@@ -138,6 +138,7 @@ class CreateOrderRequest(BaseModel):
     enrollee: Enrollee
     provider: Provider
     medications: List[Medication]
+    isTest: bool = False
 
 
 class BidOut(BaseModel):
@@ -194,6 +195,7 @@ class AssignOrderRequest(BaseModel):
 
 
 class LifecycleFields(BaseModel):
+    isTest: bool = False
     version: int = 0
     assignmentVersion: int = 0
     directQuote: Optional[dict] = None

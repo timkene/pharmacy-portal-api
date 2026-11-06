@@ -27,7 +27,12 @@ async def _require_access(aggregator_session: str | None) -> dict:
     if db_user and (("emailVerified" in db_user and not db_user.get("email")) or db_user.get("emailVerified") is False):
         code = "email_required" if not db_user.get("email") else "email_unverified"
         raise HTTPException(403, detail={"code": code, "message": "Email onboarding required"})
+    user["isTestAggregator"] = bool((db_user or {}).get("isTestAggregator", False))
     return user
+
+
+def _visible_to_aggregator(order: dict, agg_user: dict) -> bool:
+    return bool(order.get("isTest", False)) == bool(agg_user.get("isTestAggregator", False))
 
 
 def _serialize_order(order: dict) -> dict:
@@ -68,18 +73,18 @@ async def aggregator_orders_list(
     db = get_db()
 
     open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
-    open_orders = [_serialize_order(o) async for o in open_cursor]
+    open_orders = [_serialize_order(o) async for o in open_cursor if _visible_to_aggregator(o, agg_user)]
 
     active_statuses = ["direct_quote_requested", "direct_price_review", "awaiting_fulfillment", "accepted", "awaiting_confirmation"]
     active_cursor = db.orders.find(
         {"winnerId": agg_id, "status": {"$in": active_statuses}}
     ).sort("createdAt", -1)
-    active_orders = [_serialize_order(o) async for o in active_cursor]
+    active_orders = [_serialize_order(o) async for o in active_cursor if _visible_to_aggregator(o, agg_user)]
 
     fulfilled_cursor = db.orders.find(
         {"winnerId": agg_id, "status": {"$in": ["completed", "fulfilled", "not_received", "cancelled", "post_fulfilment_recalled"]}}
     ).sort("createdAt", -1)
-    fulfilled_orders = [_serialize_order(o) async for o in fulfilled_cursor]
+    fulfilled_orders = [_serialize_order(o) async for o in fulfilled_cursor if _visible_to_aggregator(o, agg_user)]
 
     return {
         "open": open_orders,
@@ -103,20 +108,20 @@ async def aggregator_dashboard(
 
     # Open bidding sessions (any aggregator can see these to place bids)
     open_cursor = db.orders.find({"status": "bidding"}).sort("biddingEndsAt", 1)
-    open_orders = [_serialize_order(o) async for o in open_cursor]
+    open_orders = [_serialize_order(o) async for o in open_cursor if _visible_to_aggregator(o, agg_user)]
 
     # Orders this aggregator won that are still active
     won_statuses = ["direct_quote_requested", "direct_price_review", "awaiting_fulfillment", "accepted", "awaiting_confirmation", "collection_verified"]
     won_cursor = db.orders.find(
         {"winnerId": agg_id, "status": {"$in": won_statuses}}
     ).sort("createdAt", -1)
-    won_orders = [_serialize_order(o) async for o in won_cursor]
+    won_orders = [_serialize_order(o) async for o in won_cursor if _visible_to_aggregator(o, agg_user)]
 
     # Orders this aggregator won that are fully fulfilled
     completed_cursor = db.orders.find(
         {"winnerId": agg_id, "status": {"$in": ["completed", "fulfilled", "not_received", "cancelled", "post_fulfilment_recalled"]}}
     ).sort("createdAt", -1)
-    completed_orders = [_serialize_order(o) async for o in completed_cursor]
+    completed_orders = [_serialize_order(o) async for o in completed_cursor if _visible_to_aggregator(o, agg_user)]
 
     return {
         "openSessions": open_orders,

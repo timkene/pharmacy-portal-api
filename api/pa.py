@@ -142,6 +142,8 @@ async def generate_pharmacy_pa(order_id: str, body: GenerationRequest, staff_ses
     actor = _staff(staff_session)
     db = get_db()
     order = await load_order(db, order_id)
+    if order.get("isTest", False):
+        raise HTTPException(422, "Test orders cannot generate production PAs")
     if order.get("version") != body.expectedVersion:
         raise HTTPException(409, "Order changed; refresh and confirm PA amounts again")
     if order.get("status") != "completed":

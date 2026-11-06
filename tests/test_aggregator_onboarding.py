@@ -171,6 +171,28 @@ def test_bidding_orders_are_visible_and_readable_but_assigned_orders_are_isolate
     assert client.get(f"/api/orders/{assigned_id}").status_code == 403
 
 
+def test_test_aggregator_isolated_from_production_orders(onboarding):
+    client, db, first, second, _, _ = onboarding
+    first.update(isTestAggregator=True, mustChangePassword=False)
+    sandbox = {"_id": ObjectId(), "status": "bidding", "isTest": True,
+               "biddingEndsAt": datetime.now(timezone.utc) + timedelta(hours=1),
+               "intakeId": "TEST-1", "createdBy": "staff", "createdAt": datetime.now(timezone.utc),
+               "enrollee": {"fullName": "Sandbox"}, "medications": []}
+    db.orders.rows.append(sandbox)
+    assert login(client, "alpha pharmacy", "alpha-password").status_code == 200
+    listed = client.get("/api/aggregator/orders").json()
+    assert [row["id"] for row in listed["open"]] == [str(sandbox["_id"])]
+    assert client.get(f"/api/orders/{db.orders.rows[1]['_id']}").status_code == 403
+    assert client.get(f"/api/orders/{sandbox['_id']}").status_code == 200
+
+    client.cookies.clear()
+    second["password_hash"] = hash_password("beta-password")
+    assert login(client, "beta pharmacy", "beta-password").status_code == 200
+    listed = client.get("/api/aggregator/orders").json()
+    assert all(row["id"] != str(sandbox["_id"]) for row in listed["open"])
+    assert client.get(f"/api/orders/{sandbox['_id']}").status_code == 403
+
+
 class _SyncCollection:
     def __init__(self, rows=()):
         self.rows = [dict(row) for row in rows]
@@ -290,3 +312,36 @@ def test_onboarding_seed_accounts_have_stable_normalized_usernames():
 
     assert [normalize(username) for _, username, _ in ACCOUNTS] == [username for _, username, _ in ACCOUNTS]
     assert len({normalize(username) for _, username, _ in ACCOUNTS}) == len(ACCOUNTS)
+
+
+def test_test_pharmacy_prepare_is_fixed_id_only_and_dry_run(monkeypatch):
+    from scripts import prepare_test_pharmacy as prepare
+
+    target = {"_id": prepare.AGGREGATOR_ID, "companyName": "Test pharmacy 1",
+              "email": "unchanged@example.com", "providerId": "4304"}
+    other = {"_id": ObjectId(), "companyName": "Other"}
+
+    class Collection:
+        def __init__(self):
+            self.rows = [target, other]
+            self.calls = []
+        def find_one(self, query):
+            return next((row for row in self.rows if row["_id"] == query["_id"]), None)
+        def update_one(self, query, update):
+            self.calls.append((query, update))
+            target.update(update["$set"])
+            target.pop("providerId", None)
+            return SimpleNamespace(matched_count=1)
+
+    collection = Collection()
+    monkeypatch.setenv("TEST_PHARMACY_TEMP_PASSWORD", "temporary-secret")
+    assert prepare.prepare(collection, dry_run=True)["dryRun"] is True
+    assert collection.calls == []
+    result = prepare.prepare(collection)
+    assert result["updated"] is True
+    assert len(collection.calls) == 1
+    assert collection.calls[0][0] == {"_id": prepare.AGGREGATOR_ID}
+    assert target["email"] == "unchanged@example.com"
+    assert target["isTestAggregator"] is True
+    assert verify_password("temporary-secret", target["password_hash"])
+    assert other == {"_id": other["_id"], "companyName": "Other"}

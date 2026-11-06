@@ -77,9 +77,9 @@ def _require_aggregator(aggregator_session: str | None) -> dict:
     return user
 
 
-async def _require_aggregator_onboarding(user: dict) -> None:
+async def _require_aggregator_onboarding(user: dict) -> dict:
     if not ObjectId.is_valid(user["userId"]):
-        return
+        return {}
     owner = await get_db().aggregator_users.find_one({"_id": ObjectId(user["userId"])})
     if owner and owner.get("mustChangePassword"):
         raise HTTPException(403, detail={"code": "password_required", "message": "Password change required"})
@@ -87,10 +87,14 @@ async def _require_aggregator_onboarding(user: dict) -> None:
         raise HTTPException(403, detail={"code": "email_required", "message": "Email registration required"})
     if owner and owner.get("emailVerified") is False:
         raise HTTPException(403, detail={"code": "email_unverified", "message": "Email verification required"})
+    user["isTestAggregator"] = bool((owner or {}).get("isTestAggregator", False))
+    return owner or {}
 
 
 async def _require_aggregator_order_access(user: dict, order: dict) -> None:
-    await _require_aggregator_onboarding(user)
+    owner = await _require_aggregator_onboarding(user)
+    if bool(order.get("isTest", False)) != bool(owner.get("isTestAggregator", False)):
+        raise HTTPException(status_code=403, detail="Order is unavailable to this aggregator")
     if order.get("status") != "bidding" and order.get("winnerId") != user["userId"]:
         raise HTTPException(status_code=403, detail="Order is not assigned to this aggregator")
 
@@ -286,8 +290,17 @@ async def check_and_close_bidding(order_id: str, db) -> dict:
         return order
 
     # Bidding has expired — find the lowest total price bid
-    bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1).limit(1)
-    winning_bids = await bids_cursor.to_list(1)
+    bids_cursor = db.bids.find({"orderId": order_id}).sort("totalPrice", 1)
+    bids = await bids_cursor.to_list(None)
+    winning_bids = []
+    for bid in bids:
+        bidder_id = bid.get("aggregatorId")
+        if not ObjectId.is_valid(bidder_id):
+            continue
+        bidder = await db.aggregator_users.find_one({"_id": ObjectId(bidder_id)})
+        if bool((bidder or {}).get("isTestAggregator", False)) == bool(order.get("isTest", False)):
+            winning_bids = [bid]
+            break
 
     if not winning_bids:
         update = {"$set": {"status": "clearline_price_review"}}
@@ -402,6 +415,7 @@ async def create_order(
         "winnerTotalPrice": None,
         "createdAt": now,
         "createdBy": staff_user["userId"],
+        "isTest": body.isTest,
     }
 
     result = await db.orders.insert_one(doc)
@@ -471,7 +485,7 @@ async def approve_order(
     # Notify enrollee via Klaire that their order has been received
     enrollee = order.get("enrollee", {})
     phone = enrollee.get("phone")
-    if phone:
+    if phone and not order.get("isTest", False):
         asyncio.create_task(notify_order_created(
             phone=phone,
             enrollee_id=enrollee.get("enrolleeId", ""),
@@ -619,7 +633,8 @@ async def clearline_approve(
     if order.get("status") != "clearline_price_review":
         raise HTTPException(status_code=400, detail="Order is not in Clearline price review")
 
-    if order.get("medications") and all(med.get("lineId") for med in order["medications"]) and order.get("winnerId"):
+    if (not order.get("isTest", False) and order.get("medications") and
+            all(med.get("lineId") for med in order["medications"]) and order.get("winnerId")):
         if not ObjectId.is_valid(order["winnerId"]):
             raise HTTPException(422, "Winning aggregator ID is invalid")
         selected_aggregator = await db.aggregator_users.find_one({"_id": ObjectId(order["winnerId"])})
@@ -789,6 +804,7 @@ async def place_bid(
     db = get_db()
 
     order = await check_and_close_bidding(order_id, db)
+    await _require_aggregator_order_access(agg_user, order)
 
     if order["status"] != "bidding":
         raise HTTPException(status_code=400, detail="Bidding session is closed")
@@ -861,6 +877,8 @@ async def accept_order(
     if order.get("status") != "awaiting_fulfillment":
         raise HTTPException(status_code=400, detail="Order is not awaiting fulfillment")
 
+    await _require_aggregator_order_access(agg_user, order)
+
     if order.get("winnerId") != agg_user["userId"]:
         raise HTTPException(status_code=403, detail="Only the winning aggregator can accept this order")
 
@@ -875,7 +893,7 @@ async def accept_order(
     # Notify enrollee via Klaire
     enrollee = order.get("enrollee", {})
     phone = enrollee.get("phone")
-    if phone:
+    if phone and not order.get("isTest", False):
         asyncio.create_task(notify_order_accepted(
             phone=phone,
             enrollee_id=enrollee.get("enrolleeId", ""),
@@ -906,6 +924,8 @@ async def fulfill_order(
     if order.get("status") != "accepted":
         raise HTTPException(status_code=400, detail="Order must be in accepted status to mark as fulfilled")
 
+    await _require_aggregator_order_access(agg_user, order)
+
     if order.get("winnerId") != agg_user["userId"]:
         raise HTTPException(status_code=403, detail="Only the winning aggregator can fulfill this order")
 
@@ -913,7 +933,7 @@ async def fulfill_order(
         check_version(order, body.expectedVersion if body else None)
         if order.get("assignmentVersion", 0) and not order.get("priceApprovedAt"):
             raise HTTPException(400, "Direct price must be approved before fulfilment")
-    if order.get("finalProcedurePrices"):
+    if order.get("finalProcedurePrices") and not order.get("isTest", False):
         aggregator = await db.aggregator_users.find_one({"_id": ObjectId(agg_user["userId"])})
         if not (aggregator or {}).get("providerId"):
             raise HTTPException(422, "Aggregator providerId must be configured before fulfilment")
@@ -943,7 +963,7 @@ async def fulfill_order(
                 delivered_set["winnerTotalPrice"] = current_total + delivery_fee
         result = await transition(db, order, delivered_set, "fulfilled", agg_user, "aggregator")
         await sse_manager.broadcast(order_id, "order_fulfilled", {})
-        if phone:
+        if phone and not order.get("isTest", False):
             asyncio.create_task(notify_order_fulfilled(
                 phone=phone,
                 enrollee_id=enrollee.get("enrolleeId", ""),
@@ -961,7 +981,7 @@ async def fulfill_order(
             **(totals(order["finalProcedurePrices"]) if order.get("finalProcedurePrices") else {}),
         }, "fulfilled", agg_user, "aggregator")
         await sse_manager.broadcast(order_id, "order_completed", {"received": True})
-        if phone:
+        if phone and not order.get("isTest", False):
             asyncio.create_task(notify_order_picked_up(
                 phone=phone,
                 enrollee_id=enrollee.get("enrolleeId", ""),
@@ -987,6 +1007,9 @@ async def klaire_callback(
     db = get_db()
 
     order = await load_order(db, order_id)
+
+    if order.get("isTest", False):
+        raise HTTPException(403, "Klaire receipt callbacks are unavailable for test orders")
 
     if order.get("status") != "awaiting_confirmation":
         # Idempotent — if already resolved, just return ok
@@ -1086,11 +1109,11 @@ async def list_aggregators(
 ):
     _require_staff(staff_session, x_service_key)
     rows = await get_db().aggregator_users.find(
-        {}, {"companyName": 1, "contactName": 1, "email": 1, "medicloudProviderId": 1}
+        {}, {"companyName": 1, "contactName": 1, "email": 1, "medicloudProviderId": 1, "isTestAggregator": 1}
     ).to_list(None)
     return [{"id": str(row["_id"]), "companyName": row.get("companyName"),
              "contactName": row.get("contactName"), "email": row.get("email"),
-             "medicloudProviderId": row.get("medicloudProviderId")} for row in rows]
+             "medicloudProviderId": None if row.get("isTestAggregator", False) else row.get("medicloudProviderId")} for row in rows]
 
 
 @router.post("/orders/{order_id}/assign")
@@ -1114,7 +1137,11 @@ async def assign_order(
     aggregator = await db.aggregator_users.find_one({"_id": ObjectId(body.aggregatorId)})
     if not aggregator:
         raise HTTPException(status_code=404, detail="Aggregator not found")
-    if order.get("medications") and all(med.get("lineId") for med in order["medications"]) and not str(aggregator.get("providerId") or "").strip():
+    if bool(order.get("isTest", False)) != bool(aggregator.get("isTestAggregator", False)):
+        raise HTTPException(403, "Test orders may only be assigned to test aggregators")
+    if (not order.get("isTest", False) and order.get("medications") and
+            all(med.get("lineId") for med in order["medications"]) and
+            not str(aggregator.get("providerId") or "").strip()):
         raise HTTPException(422, "Aggregator providerId must be configured before assignment")
     result = await transition(db, order, {
         "status": "direct_quote_requested", "assignmentType": "direct",
@@ -1127,7 +1154,7 @@ async def assign_order(
         "assignmentVersion": order.get("assignmentVersion", 0) + 1,
     }, "direct_reassigned" if order["status"] == "direct_reassignment" else "direct_assigned", staff, "staff")
     enrollee = order.get("enrollee", {})
-    if enrollee.get("phone"):
+    if enrollee.get("phone") and not order.get("isTest", False):
         asyncio.create_task(notify_order_created(
             phone=enrollee["phone"], enrollee_id=enrollee.get("enrolleeId", ""),
             enrollee_name=enrollee.get("fullName", ""), medications=_med_names(order), order_id=order_id,
